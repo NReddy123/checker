@@ -33,7 +33,7 @@ pub fn compare_text(left: &str, right: &str) -> Vec<DiffLine> {
 
 #[cfg(test)]
 mod tests {
-    use super::{compare_text, DiffKind};
+    use super::{DiffKind, compare_text};
 
     #[test]
     fn aligns_insertions_without_marking_unchanged_lines_as_different() {

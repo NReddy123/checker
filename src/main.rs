@@ -1,6 +1,7 @@
 mod diff;
 
-use diff::{compare_text, DiffKind, DiffLine};
+use diff::{DiffKind, DiffLine, compare_text};
+use gpui_kit::component::button::*;
 use gpui_kit::component::{
     input::{Input, InputState},
     *,
@@ -19,12 +20,10 @@ struct Checker {
 impl Checker {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         Self {
-            left_path: cx.new(|cx| {
-                InputState::new(window, cx).placeholder("Enter the first file path")
-            }),
-            right_path: cx.new(|cx| {
-                InputState::new(window, cx).placeholder("Enter the second file path")
-            }),
+            left_path: cx
+                .new(|cx| InputState::new(window, cx).placeholder("Enter the first file path")),
+            right_path: cx
+                .new(|cx| InputState::new(window, cx).placeholder("Enter the second file path")),
             rows: Vec::new(),
             status: "Choose two text files to see what changed.".into(),
             compared: false,
@@ -151,22 +150,18 @@ impl Render for Checker {
                         div()
                             .h_flex()
                             .gap_3()
-                            .child(
-                                file_picker_card(
-                                    "01",
-                                    "Original",
-                                    &self.left_path,
-                                    rgb(0x73a7ff),
-                                ),
-                            )
-                            .child(
-                                file_picker_card(
-                                    "02",
-                                    "Modified",
-                                    &self.right_path,
-                                    rgb(0x56d6ad),
-                                ),
-                            ),
+                            .child(file_picker_card(
+                                "01",
+                                "Original",
+                                &self.left_path,
+                                0x73a7ff,
+                            ))
+                            .child(file_picker_card(
+                                "02",
+                                "Modified",
+                                &self.right_path,
+                                0x56d6ad,
+                            )),
                     )
                     .child(
                         div()
@@ -176,9 +171,7 @@ impl Render for Checker {
                             .child(
                                 div()
                                     .text_size(px(12.))
-                                    .text_color(if self.compared
-                                        && (added > 0 || removed > 0)
-                                    {
+                                    .text_color(if self.compared && (added > 0 || removed > 0) {
                                         rgb(0xd1a96b)
                                     } else {
                                         rgb(0x9ea8b7)
@@ -201,7 +194,7 @@ fn file_picker_card(
     number: &str,
     title: &str,
     input_state: &Entity<InputState>,
-    accent: Rgba,
+    accent: u32,
 ) -> impl IntoElement {
     div()
         .v_flex()
@@ -220,7 +213,7 @@ fn file_picker_card(
                 .child(
                     div()
                         .text_size(px(11.))
-                        .text_color(accent)
+                        .text_color(rgb(accent))
                         .child(number.to_owned()),
                 )
                 .child(
@@ -350,22 +343,12 @@ fn diff_cell(
                 .text_size(px(11.))
                 .child(number.to_owned()),
         )
-        .child(
-            div()
-                .w(px(12.))
-                .text_size(px(12.))
-                .child(marker.to_owned()),
-        )
-        .child(
-            div()
-                .flex_1()
-                .text_size(px(12.))
-                .child(if text.is_empty() {
-                    " ".to_owned()
-                } else {
-                    text.to_owned()
-                }),
-        )
+        .child(div().w(px(12.)).text_size(px(12.)).child(marker.to_owned()))
+        .child(div().flex_1().text_size(px(12.)).child(if text.is_empty() {
+            " ".to_owned()
+        } else {
+            text.to_owned()
+        }))
 }
 
 fn main() {
