@@ -1,9 +1,11 @@
 mod diff;
 
 use diff::{DiffKind, DiffLine, compare_text};
+
 use gpui_kit::component::button::*;
 use gpui_kit::component::{
     input::{Input, InputState},
+    scroll::ScrollableElement as _,
     *,
 };
 use gpui_kit::*;
@@ -146,6 +148,8 @@ impl Render for Checker {
                     .v_flex()
                     .gap_4()
                     .p_6()
+                    .flex_1()
+                    .min_h_0()
                     .child(
                         div()
                             .h_flex()
@@ -185,7 +189,13 @@ impl Render for Checker {
                                     .on_click(cx.listener(|this, _, _, cx| this.compare(cx))),
                             ),
                     )
-                    .child(self.render_diff()),
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scrollbar()
+                            .child(self.render_diff()),
+                    ),
             )
     }
 }
