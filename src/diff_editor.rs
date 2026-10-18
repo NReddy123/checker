@@ -2,6 +2,7 @@ use crate::diff::{
     CompareOptions, DiffLine, DiffProjection, DiffSide, apply_hunk_copy, compare_text_with_options,
 };
 use std::ops::Range;
+use std::sync::Arc;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TextBuffer {
@@ -52,8 +53,8 @@ pub(crate) enum DiffEditorError {
 pub(crate) struct DiffEditorCore {
     left: TextBuffer,
     right: TextBuffer,
-    rows: Vec<DiffLine>,
-    projection: DiffProjection,
+    rows: Arc<[DiffLine]>,
+    projection: Arc<DiffProjection>,
     options: CompareOptions,
     undo: Vec<EditOperation>,
     redo: Vec<EditOperation>,
@@ -67,17 +68,49 @@ impl DiffEditorCore {
         right_saved: Option<String>,
         options: CompareOptions,
     ) -> Self {
-        let mut editor = Self {
+        let rows = compare_text_with_options(&left, &right, options);
+        Self::new_with_rows(left, right, left_saved, right_saved, options, rows)
+    }
+
+    pub(crate) fn new_with_rows(
+        left: String,
+        right: String,
+        left_saved: Option<String>,
+        right_saved: Option<String>,
+        options: CompareOptions,
+        rows: Vec<DiffLine>,
+    ) -> Self {
+        let rows: Arc<[DiffLine]> = rows.into();
+        let projection = Arc::new(DiffProjection::from_rows(&rows));
+        Self::new_with_snapshot(
+            left,
+            right,
+            left_saved,
+            right_saved,
+            options,
+            rows,
+            projection,
+        )
+    }
+
+    pub(crate) fn new_with_snapshot(
+        left: String,
+        right: String,
+        left_saved: Option<String>,
+        right_saved: Option<String>,
+        options: CompareOptions,
+        rows: Arc<[DiffLine]>,
+        projection: Arc<DiffProjection>,
+    ) -> Self {
+        Self {
             left: TextBuffer::new(left, left_saved),
             right: TextBuffer::new(right, right_saved),
-            rows: Vec::new(),
-            projection: DiffProjection::default(),
+            rows,
+            projection,
             options,
             undo: Vec::new(),
             redo: Vec::new(),
-        };
-        editor.recompute();
-        editor
+        }
     }
 
     pub(crate) fn text(&self, side: DiffSide) -> &str {
@@ -88,8 +121,16 @@ impl DiffEditorCore {
         &self.rows
     }
 
+    pub(crate) fn rows_snapshot(&self) -> Arc<[DiffLine]> {
+        self.rows.clone()
+    }
+
     pub(crate) fn projection(&self) -> &DiffProjection {
         &self.projection
+    }
+
+    pub(crate) fn projection_snapshot(&self) -> Arc<DiffProjection> {
+        self.projection.clone()
     }
 
     pub(crate) fn cursor(&self, side: DiffSide) -> usize {
@@ -552,8 +593,10 @@ impl DiffEditorCore {
     }
 
     fn recompute(&mut self) {
-        self.rows = compare_text_with_options(&self.left.text, &self.right.text, self.options);
-        self.projection = DiffProjection::from_rows(&self.rows);
+        let rows: Arc<[DiffLine]> =
+            compare_text_with_options(&self.left.text, &self.right.text, self.options).into();
+        self.projection = Arc::new(DiffProjection::from_rows(&rows));
+        self.rows = rows;
     }
 
     fn insertion_offset_for_virtual_row(&self, side: DiffSide, display_row: usize) -> usize {
@@ -574,14 +617,15 @@ impl DiffEditorCore {
         let source = self.text(side);
         let offset = self.insertion_offset_for_virtual_row(side, display_row);
         let eol = line_ending_for(source, offset);
-        let insertion = if source.is_empty() {
-            text.to_owned()
+        let (insertion, cursor) = if source.is_empty() {
+            (text.to_owned(), offset + text.len())
         } else if offset == 0 || offset < source.len() || source.ends_with(['\n', '\r']) {
-            format!("{text}{eol}")
+            (format!("{text}{eol}"), offset + text.len())
         } else {
-            format!("{eol}{text}")
+            (format!("{eol}{text}"), offset + eol.len() + text.len())
         };
-        self.replace_range_untracked(side, offset..offset, &insertion)
+        self.replace_range_untracked(side, offset..offset, &insertion)?;
+        self.set_cursor(side, cursor)
     }
 
     fn span_for_row(&self, side: DiffSide, row: usize) -> Option<&crate::diff::SourceSpan> {
@@ -724,6 +768,24 @@ mod tests {
             .replace_display_line(DiffSide::Left, row, "last")
             .unwrap();
         assert_eq!(editor.text(DiffSide::Left), "first\nlast\n");
+    }
+
+    #[test]
+    fn typing_into_virtual_row_keeps_caret_on_inserted_line() {
+        let mut editor = file_editor("first\n", "first\nmiddle\n");
+        let row = editor.rows().len() - 1;
+
+        for text in ["m", "mi", "mid", "midd", "middle"] {
+            editor
+                .replace_display_line(DiffSide::Left, row, text)
+                .unwrap();
+            assert_eq!(
+                editor.cursor_display_position(DiffSide::Left),
+                (row, text.len())
+            );
+        }
+
+        assert_eq!(editor.text(DiffSide::Left), "first\nmiddle\n");
     }
 
     #[test]

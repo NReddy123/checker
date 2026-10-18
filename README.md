@@ -24,7 +24,12 @@ Include and ignore fields accept comma-separated `*`/`?` path patterns; `.git`
 folders and simple patterns in either root's `.gitignore` are also ignored.
 Select **Open** beside a listed file to inspect its line diff. Folder
 synchronization copies files from the chosen side to the other without
-deleting destination-only files.
+deleting destination-only files. Folder scans and file/text diff computation
+run in the background so large comparisons do not block the interface. Folder
+comparison skips content reads when file sizes differ and compares same-sized
+files in bounded chunks. The diff pane uses GPUI's virtual list and creates
+native editing inputs only for visible or focused rows; immutable row and
+projection snapshots are shared across the editor and comparison sessions.
 
 For text comparisons, use the whitespace, case, and comment toggles to control
 line matching. Search filters visible diff rows, and the star controls let you

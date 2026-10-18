@@ -5,6 +5,7 @@ use gpui_kit::base::StyledExt as _;
 use gpui_kit::component::input::{Editor, EditorState, Input, InputState};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::{Sizable as _, Size};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use std::path::PathBuf;
 use std::time::SystemTime;
@@ -250,14 +251,17 @@ pub(crate) fn labeled_input(
 pub(crate) fn diff_cell(
     number: &str,
     input_state: &Entity<InputState>,
+    focused: bool,
     background: u32,
     foreground: u32,
     font_size: f32,
     palette: &ThemePalette,
     on_key_down: impl Fn(&KeyDownEvent, &mut Window, &mut App) + 'static,
+    on_mouse_down: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     let cell = div()
         .on_key_down(on_key_down)
+        .on_mouse_down(MouseButton::Left, on_mouse_down)
         .h_flex()
         .flex_1()
         .min_w(px(0.))
@@ -265,6 +269,9 @@ pub(crate) fn diff_cell(
         .h(px((font_size + 8.).max(18.)))
         .gap_2()
         .bg(rgb(background))
+        .when(focused, |this| {
+            this.border_1().border_color(rgb(palette.accent))
+        })
         .font_family("Cascadia Code")
         .child(
             div()
@@ -277,9 +284,11 @@ pub(crate) fn diff_cell(
     // text span; native selection, clipboard, IME, and caret behavior stay active.
     cell.child(
         Input::new(input_state)
-            .appearance(false)
-            .bordered(false)
-            .focus_bordered(false)
+            .disabled(false)
+            .readonly(false)
+            .appearance(true)
+            .bordered(true)
+            .focus_bordered(true)
             .with_size(Size::XSmall)
             .h_full()
             .text_color(rgb(foreground))

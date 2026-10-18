@@ -1,0 +1,5 @@
+{
+  "environment": "staging",
+  "retries": 3,
+  "logging": true
+}

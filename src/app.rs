@@ -1,6 +1,6 @@
 use crate::diff::{
-    CompareOptions, DiffKind, DiffLine, DiffProjection, DiffSide, change_hunks,
-    compare_text_with_options, merge_three_way,
+    CompareOptions, DiffKind, DiffLine, DiffProjection, DiffSide, compare_text_with_options,
+    merge_three_way,
 };
 use crate::diff_editor::DiffEditorCore;
 use crate::folder::{
@@ -24,9 +24,11 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::ops::Range;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 actions!(
     checker,
@@ -57,6 +59,113 @@ actions!(
     ]
 );
 
+enum ComparisonResult {
+    Folder(Vec<FolderEntry>),
+    File {
+        left: String,
+        right: String,
+        base: Option<String>,
+        rows: Vec<DiffLine>,
+        merge_context: Option<MergeContext>,
+        status: String,
+    },
+}
+
+fn compare_paths(
+    mode: Option<CompareMode>,
+    left: PathBuf,
+    right: PathBuf,
+    base: Option<PathBuf>,
+    includes: Vec<String>,
+    ignores: Vec<String>,
+    options: CompareOptions,
+) -> Result<ComparisonResult, String> {
+    let left_is_dir = left.is_dir();
+    let right_is_dir = right.is_dir();
+    if mode == Some(CompareMode::Folder) && !(left_is_dir && right_is_dir) {
+        return Err("Folder Compare requires two existing folders.".into());
+    }
+    if mode == Some(CompareMode::File) && (left_is_dir || right_is_dir) {
+        return Err("File Compare requires two file paths, not folders.".into());
+    }
+
+    match (left_is_dir, right_is_dir) {
+        (true, true) => compare_folders(&left, &right, &includes, &ignores)
+            .map(ComparisonResult::Folder)
+            .map_err(|error| format!("Could not compare folders: {error}")),
+        (false, false) => {
+            let left_contents = fs::read_to_string(&left)
+                .map_err(|error| format!("Could not read {}: {error}", left.display()))?;
+            let right_contents = fs::read_to_string(&right)
+                .map_err(|error| format!("Could not read {}: {error}", right.display()))?;
+            let base_contents = base
+                .as_ref()
+                .map(|path| {
+                    fs::read_to_string(path).map_err(|error| {
+                        format!("Could not read base file {}: {error}", path.display())
+                    })
+                })
+                .transpose()?;
+
+            let (right_content, merge_context, status) =
+                if let Some(base_contents) = base_contents.as_ref() {
+                    let (merged, conflicts) =
+                        merge_three_way(base_contents, &left_contents, &right_contents);
+                    let context = MergeContext {
+                        base: base_contents.clone(),
+                        left: left_contents.clone(),
+                        right: right_contents,
+                        conflicts,
+                    };
+                    (
+                        merged,
+                        Some(context),
+                        format!("3-way result staged on the right · {conflicts} conflict(s)"),
+                    )
+                } else {
+                    let rows = compare_text_with_options(&left_contents, &right_contents, options);
+                    let changed = rows
+                        .iter()
+                        .filter(|line| line.kind != DiffKind::Equal)
+                        .count();
+                    let status = if changed == 0 {
+                        "The files are identical under the selected rules.".into()
+                    } else {
+                        format!("{changed} changed line(s)")
+                    };
+                    return Ok(ComparisonResult::File {
+                        left: left_contents,
+                        right: right_contents,
+                        base: None,
+                        rows,
+                        merge_context: None,
+                        status,
+                    });
+                };
+            let rows = compare_text_with_options(&left_contents, &right_content, options);
+            Ok(ComparisonResult::File {
+                left: left_contents,
+                right: right_content,
+                base: base_contents,
+                rows,
+                merge_context,
+                status,
+            })
+        }
+        _ => Err("Both paths must be files or both must be folders.".into()),
+    }
+}
+
+#[derive(PartialEq, Eq)]
+struct VisibleDiffRowsKey {
+    revision: u64,
+    query: String,
+    filter: DiffFilter,
+    bookmark: Option<usize>,
+    active_row: Option<usize>,
+    pending_row: Option<usize>,
+}
+
 struct Checker {
     menu_bar: Entity<AppMenuBar>,
     focus_handle: FocusHandle,
@@ -72,11 +181,15 @@ struct Checker {
     active_session: usize,
     show_home: bool,
     mode: Option<CompareMode>,
-    rows: Vec<DiffLine>,
-    diff_projection: DiffProjection,
+    rows: Arc<[DiffLine]>,
+    diff_projection: Arc<DiffProjection>,
     diff_editor: DiffEditorCore,
-    left_diff_inputs: Vec<Entity<InputState>>,
-    right_diff_inputs: Vec<Entity<InputState>>,
+    left_diff_inputs: BTreeMap<usize, Entity<InputState>>,
+    right_diff_inputs: BTreeMap<usize, Entity<InputState>>,
+    diff_scroll_handle: UniformListScrollHandle,
+    diff_rows_revision: u64,
+    visible_diff_rows_key: Option<VisibleDiffRowsKey>,
+    visible_diff_rows: Arc<[(usize, bool)]>,
     active_diff_input: Option<(DiffSide, usize)>,
     last_diff_input: Option<(DiffSide, usize)>,
     pending_diff_focus: Option<(DiffSide, usize, usize)>,
@@ -104,6 +217,7 @@ struct Checker {
     editor_font_size: f32,
     theme: AppTheme,
     status: String,
+    comparison_generation: u64,
 }
 
 impl Checker {
@@ -157,8 +271,8 @@ impl Checker {
             active_session: 0,
             show_home: true,
             mode: None,
-            rows: Vec::new(),
-            diff_projection: DiffProjection::default(),
+            rows: Arc::from([]),
+            diff_projection: Arc::new(DiffProjection::default()),
             diff_editor: DiffEditorCore::new(
                 String::new(),
                 String::new(),
@@ -166,8 +280,12 @@ impl Checker {
                 None,
                 CompareOptions::default(),
             ),
-            left_diff_inputs: Vec::new(),
-            right_diff_inputs: Vec::new(),
+            left_diff_inputs: BTreeMap::new(),
+            right_diff_inputs: BTreeMap::new(),
+            diff_scroll_handle: UniformListScrollHandle::new(),
+            diff_rows_revision: 0,
+            visible_diff_rows_key: None,
+            visible_diff_rows: Arc::from([]),
             active_diff_input: None,
             last_diff_input: None,
             pending_diff_focus: None,
@@ -196,6 +314,7 @@ impl Checker {
             theme,
             status: startup_status
                 .unwrap_or_else(|| "Choose a comparison type to get started.".into()),
+            comparison_generation: 0,
         };
         checker
     }
@@ -231,6 +350,7 @@ impl Checker {
         session.left_text = self.left_content.clone();
         session.right_text = self.right_content.clone();
         session.rows = self.rows.clone();
+        session.diff_projection = self.diff_projection.clone();
         session.folder_entries = self.folder_entries.clone();
         session.left_content = self.left_content.clone();
         session.right_content = self.right_content.clone();
@@ -257,8 +377,58 @@ impl Checker {
     }
 
     fn set_rows(&mut self, rows: Vec<DiffLine>) {
+        let rows: Arc<[DiffLine]> = rows.into();
+        let projection = Arc::new(DiffProjection::from_rows(&rows));
+        self.set_diff_snapshot(rows, projection);
+    }
+
+    fn set_diff_snapshot(&mut self, rows: Arc<[DiffLine]>, projection: Arc<DiffProjection>) {
         self.rows = rows;
-        self.diff_projection = DiffProjection::from_rows(&self.rows);
+        self.diff_projection = projection;
+        self.diff_rows_revision = self.diff_rows_revision.wrapping_add(1);
+        self.visible_diff_rows_key = None;
+    }
+
+    fn reset_diff_input_states(&mut self) {
+        self.left_diff_inputs.clear();
+        self.right_diff_inputs.clear();
+        self.active_diff_input = None;
+        self.last_diff_input = None;
+        self.pending_diff_focus = None;
+    }
+
+    fn recompute_rows_in_background(
+        &mut self,
+        cx: &mut Context<Self>,
+        completion_status: Option<String>,
+    ) {
+        let left = self.left_content.clone();
+        let right = self.right_content.clone();
+        let options = self.compare_options();
+        self.invalidate_comparison();
+        let generation = self.comparison_generation;
+        cx.spawn(async move |this, cx| {
+            let rows = cx
+                .background_executor()
+                .spawn(async move { compare_text_with_options(&left, &right, options) })
+                .await;
+            if let Err(error) = this.update(cx, |this, cx| {
+                if this.comparison_generation == generation {
+                    this.reset_diff_editor_with_rows(rows);
+                    if let Some(status) = completion_status {
+                        this.status = status;
+                    }
+                    cx.notify();
+                }
+            }) {
+                eprintln!("Could not update the diff after recomputing it: {error}");
+            }
+        })
+        .detach();
+    }
+
+    fn invalidate_comparison(&mut self) {
+        self.comparison_generation = self.comparison_generation.wrapping_add(1);
     }
 
     fn compare_options(&self) -> CompareOptions {
@@ -277,8 +447,29 @@ impl Checker {
             self.right_original.clone(),
             self.compare_options(),
         );
-        self.rows = self.diff_editor.rows().to_vec();
-        self.diff_projection = self.diff_editor.projection().clone();
+        self.set_diff_snapshot(
+            self.diff_editor.rows_snapshot(),
+            self.diff_editor.projection_snapshot(),
+        );
+    }
+
+    fn reset_diff_editor_with_rows(&mut self, rows: Vec<DiffLine>) {
+        let rows: Arc<[DiffLine]> = rows.into();
+        let projection = Arc::new(DiffProjection::from_rows(&rows));
+        self.set_diff_snapshot(rows, projection);
+        self.reset_diff_editor_from_snapshot();
+    }
+
+    fn reset_diff_editor_from_snapshot(&mut self) {
+        self.diff_editor = DiffEditorCore::new_with_snapshot(
+            self.left_content.clone(),
+            self.right_content.clone(),
+            self.left_original.clone(),
+            self.right_original.clone(),
+            self.compare_options(),
+            self.rows.clone(),
+            self.diff_projection.clone(),
+        );
     }
 
     fn ensure_diff_editor(&mut self) {
@@ -290,17 +481,14 @@ impl Checker {
             self.compare_options(),
         ) {
             self.reset_diff_editor();
-        } else {
-            self.rows = self.diff_editor.rows().to_vec();
-            self.diff_projection = self.diff_editor.projection().clone();
         }
     }
 
     fn sync_from_diff_editor(&mut self, stable_side: DiffSide, old_rows: &[DiffLine]) {
         self.left_content = self.diff_editor.text(DiffSide::Left).to_owned();
         self.right_content = self.diff_editor.text(DiffSide::Right).to_owned();
-        let new_rows = self.diff_editor.rows().to_vec();
-        let new_projection = self.diff_editor.projection().clone();
+        let new_rows = self.diff_editor.rows_snapshot();
+        let new_projection = self.diff_editor.projection_snapshot();
         let remap = |old_index: usize| {
             let old = old_rows.get(old_index)?;
             let (line_number, line_text) = match stable_side {
@@ -327,8 +515,7 @@ impl Checker {
         self.bookmark_cursor = self
             .bookmark_cursor
             .min(self.bookmarks.len().saturating_sub(1));
-        self.rows = new_rows;
-        self.diff_projection = new_projection;
+        self.set_diff_snapshot(new_rows, new_projection);
         self.compared = true;
         let changed = self
             .rows
@@ -373,46 +560,113 @@ impl Checker {
         }
     }
 
-    fn ensure_diff_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let row_count = self.diff_editor_row_count();
-        while self.left_diff_inputs.len() < row_count {
-            let row = self.left_diff_inputs.len();
-            let value = self.diff_cell_text(DiffSide::Left, row);
-            self.left_diff_inputs.push(Self::new_diff_input(
-                DiffSide::Left,
-                row,
-                value,
-                window,
-                cx,
-            ));
+    fn update_visible_diff_rows(&mut self, query: String) {
+        let active_row = self.active_diff_input.map(|(_, row)| row);
+        let pending_row = self.pending_diff_focus.map(|(_, row, _)| row);
+        let key = VisibleDiffRowsKey {
+            revision: self.diff_rows_revision,
+            query,
+            filter: self.diff_filter,
+            bookmark: self.selected_bookmark,
+            active_row,
+            pending_row,
+        };
+        if self.visible_diff_rows_key.as_ref() == Some(&key) {
+            return;
         }
-        while self.right_diff_inputs.len() < row_count {
-            let row = self.right_diff_inputs.len();
-            let value = self.diff_cell_text(DiffSide::Right, row);
-            self.right_diff_inputs.push(Self::new_diff_input(
-                DiffSide::Right,
-                row,
-                value,
-                window,
-                cx,
-            ));
+        if self.visible_diff_rows_key.as_ref().is_some_and(|previous| {
+            previous.query != key.query
+                || previous.filter != key.filter
+                || previous.bookmark != key.bookmark
+        }) {
+            self.diff_scroll_handle
+                .scroll_to_item(0, ScrollStrategy::Top);
         }
-        self.left_diff_inputs.truncate(row_count);
-        self.right_diff_inputs.truncate(row_count);
 
-        for row in 0..row_count {
-            for (side, input, value) in [
-                (
-                    DiffSide::Left,
-                    self.left_diff_inputs[row].clone(),
-                    self.diff_cell_text(DiffSide::Left, row),
-                ),
-                (
-                    DiffSide::Right,
-                    self.right_diff_inputs[row].clone(),
-                    self.diff_cell_text(DiffSide::Right, row),
-                ),
-            ] {
+        let mut visible_rows = Vec::new();
+        let mut hunk_start = None;
+        let mut visible_hunks = BTreeSet::new();
+        for index in 0..self.diff_editor_row_count() {
+            let line = self.rows.get(index);
+            let kind = line.map(|line| line.kind).unwrap_or(DiffKind::Equal);
+            if kind == DiffKind::Equal {
+                hunk_start = None;
+            } else if hunk_start.is_none() {
+                hunk_start = Some(index);
+            }
+
+            let force_visible = active_row == Some(index) || pending_row == Some(index);
+            let matches_filter = match self.diff_filter {
+                DiffFilter::All => true,
+                DiffFilter::Differences => kind != DiffKind::Equal,
+                DiffFilter::Same => kind == DiffKind::Equal,
+            };
+            let matches_bookmark = self.selected_bookmark.is_none_or(|row| row == index);
+            let matches_query = self.selected_bookmark.is_some()
+                || key.query.is_empty()
+                || line.is_some_and(|line| {
+                    line.left_text.to_lowercase().contains(&key.query)
+                        || line.right_text.to_lowercase().contains(&key.query)
+                });
+            if force_visible || matches_filter && matches_bookmark && matches_query {
+                let first_hunk_row = hunk_start.is_some_and(|start| visible_hunks.insert(start));
+                visible_rows.push((index, first_hunk_row));
+            }
+        }
+        self.visible_diff_rows = visible_rows.into();
+        self.visible_diff_rows_key = Some(key);
+    }
+
+    fn scroll_to_diff_row(&mut self, row: usize, cx: &Context<Self>) {
+        self.update_visible_diff_rows(self.search.read(cx).value().to_string().to_lowercase());
+        if let Ok(slot) = self
+            .visible_diff_rows
+            .binary_search_by_key(&row, |(source_row, _)| *source_row)
+        {
+            self.diff_scroll_handle
+                .scroll_to_item(slot, ScrollStrategy::Nearest);
+        }
+    }
+
+    fn ensure_diff_inputs(
+        &mut self,
+        rows: &[(usize, bool)],
+        range: Range<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let visible: BTreeSet<_> = range.clone().map(|slot| rows[slot].0).collect();
+        let mut retained = visible.clone();
+        for row in self
+            .active_diff_input
+            .map(|(_, row)| row)
+            .into_iter()
+            .chain(self.last_diff_input.map(|(_, row)| row))
+            .chain(self.pending_diff_focus.map(|(_, row, _)| row))
+        {
+            if row < self.diff_editor_row_count() {
+                retained.insert(row);
+            }
+        }
+        let is_measurement_range = range.start == 0 && range.end == 1;
+        if !is_measurement_range {
+            self.left_diff_inputs
+                .retain(|row, _| retained.contains(row));
+            self.right_diff_inputs
+                .retain(|row, _| retained.contains(row));
+        }
+
+        for slot in range {
+            let row = rows[slot].0;
+            for side in [DiffSide::Left, DiffSide::Right] {
+                let value = self.diff_cell_text(side, row);
+                let input = match side {
+                    DiffSide::Left => &mut self.left_diff_inputs,
+                    DiffSide::Right => &mut self.right_diff_inputs,
+                }
+                .entry(row)
+                .or_insert_with(|| Self::new_diff_input(side, row, value.clone(), window, cx))
+                .clone();
                 if input.read(cx).value().as_ref() != value {
                     let previous_column = input.read(cx).selected_range().end;
                     input.update(cx, |state, cx| state.set_value(value, window, cx));
@@ -425,18 +679,20 @@ impl Checker {
             }
         }
 
-        if let Some((side, row, column)) = self.pending_diff_focus.take()
-            && row < row_count
+        if let Some((side, row, column)) = self.pending_diff_focus
+            && visible.contains(&row)
+            && let Some(input) = match side {
+                DiffSide::Left => self.left_diff_inputs.get(&row),
+                DiffSide::Right => self.right_diff_inputs.get(&row),
+            }
+            .cloned()
         {
-            let input = match side {
-                DiffSide::Left => &self.left_diff_inputs[row],
-                DiffSide::Right => &self.right_diff_inputs[row],
-            };
             input.update(cx, |state, cx| {
                 let offset = column.min(state.value().len());
                 state.set_selected_range(offset..offset, cx);
                 state.focus(window, cx);
             });
+            self.pending_diff_focus = None;
             self.active_diff_input = Some((side, row));
             self.last_diff_input = Some((side, row));
         }
@@ -454,14 +710,15 @@ impl Checker {
             InputEvent::Focus => {
                 self.active_diff_input = Some((side, row));
                 self.last_diff_input = Some((side, row));
+                cx.notify();
             }
             InputEvent::Blur => {
                 if self.active_diff_input == Some((side, row)) {
                     self.active_diff_input = None;
                 }
+                cx.notify();
             }
             InputEvent::Change => {
-                self.ensure_diff_editor();
                 let old_rows = self.rows.clone();
                 let text = input.read(cx).value().to_string();
                 if let Err(error) = self.diff_editor.replace_display_line(side, row, &text) {
@@ -483,7 +740,6 @@ impl Checker {
                 cx.notify();
             }
             InputEvent::PressEnter { .. } => {
-                self.ensure_diff_editor();
                 let old_rows = self.rows.clone();
                 let selection = input.read(cx).selected_range();
                 match self.diff_editor.split_display_line(side, row, selection) {
@@ -513,8 +769,8 @@ impl Checker {
             return;
         }
         let input = match side {
-            DiffSide::Left => self.left_diff_inputs.get(row),
-            DiffSide::Right => self.right_diff_inputs.get(row),
+            DiffSide::Left => self.left_diff_inputs.get(&row),
+            DiffSide::Right => self.right_diff_inputs.get(&row),
         };
         let Some(input) = input.cloned() else {
             return;
@@ -542,7 +798,6 @@ impl Checker {
                 self.next_visible_diff_row(row, 1, cx).map(|row| (row, 0))
             }
             "backspace" if cursor == 0 => {
-                self.ensure_diff_editor();
                 let old_rows = self.rows.clone();
                 match self.diff_editor.merge_display_line_with_previous(side, row) {
                     Ok(true) => {
@@ -560,7 +815,6 @@ impl Checker {
                 None
             }
             "delete" if cursor == value.len() => {
-                self.ensure_diff_editor();
                 let old_rows = self.rows.clone();
                 match self.diff_editor.merge_display_line_with_next(side, row) {
                     Ok(true) => {
@@ -581,9 +835,11 @@ impl Checker {
         };
 
         if let Some((target_row, target_column)) = target {
+            self.pending_diff_focus = Some((side, target_row, target_column));
+            self.scroll_to_diff_row(target_row, cx);
             let target_input = match side {
-                DiffSide::Left => self.left_diff_inputs.get(target_row),
-                DiffSide::Right => self.right_diff_inputs.get(target_row),
+                DiffSide::Left => self.left_diff_inputs.get(&target_row),
+                DiffSide::Right => self.right_diff_inputs.get(&target_row),
             };
             if let Some(target_input) = target_input.cloned() {
                 target_input.update(cx, |state, cx| {
@@ -597,6 +853,7 @@ impl Checker {
                 });
                 self.active_diff_input = Some((side, target_row));
                 self.last_diff_input = Some((side, target_row));
+                self.pending_diff_focus = None;
             }
             cx.notify();
         }
@@ -644,6 +901,7 @@ impl Checker {
         if index == self.active_session {
             return;
         }
+        self.invalidate_comparison();
         self.persist_active_session(cx);
         let session = self.sessions[index].clone();
         self.active_session = index;
@@ -672,8 +930,7 @@ impl Checker {
         self.right_text_editor.update(cx, |state, cx| {
             state.set_value(session.right_text, window, cx)
         });
-        self.rows = session.rows;
-        self.diff_projection = DiffProjection::from_rows(&self.rows);
+        self.set_diff_snapshot(session.rows, session.diff_projection);
         self.folder_entries = session.folder_entries;
         self.left_content = session.left_content;
         self.right_content = session.right_content;
@@ -696,9 +953,10 @@ impl Checker {
         self.folder_filter = session.folder_filter;
         self.diff_filter = session.diff_filter;
         self.status = session.status;
-        self.active_diff_input = None;
-        self.last_diff_input = None;
-        self.pending_diff_focus = None;
+        self.reset_diff_editor_from_snapshot();
+        self.diff_scroll_handle
+            .scroll_to_item(0, ScrollStrategy::Top);
+        self.reset_diff_input_states();
         cx.notify();
     }
 
@@ -716,6 +974,7 @@ impl Checker {
             cx.notify();
             return;
         }
+        self.invalidate_comparison();
         if self.mode != Some(mode) {
             self.left_path
                 .update(cx, |state, cx| state.set_value("", window, cx));
@@ -744,9 +1003,7 @@ impl Checker {
             self.bookmarks.clear();
             self.bookmark_cursor = 0;
             self.selected_bookmark = None;
-            self.active_diff_input = None;
-            self.last_diff_input = None;
-            self.pending_diff_focus = None;
+            self.reset_diff_input_states();
             self.active_panel = if mode == CompareMode::Text {
                 MainPanel::TextInput
             } else {
@@ -825,38 +1082,58 @@ impl Checker {
         }
         self.left_original = None;
         self.right_original = None;
-        self.rows = compare_text_with_options(
-            &self.left_content,
-            &self.right_content,
-            CompareOptions {
-                ignore_whitespace: self.ignore_whitespace,
-                ignore_case: self.ignore_case,
-                ignore_comments: self.ignore_comments,
-            },
-        );
-        self.diff_projection = DiffProjection::from_rows(&self.rows);
-        self.folder_mode = false;
-        self.folder_entries.clear();
-        self.selected_folder_file = None;
-        self.compared = true;
-        self.active_panel = MainPanel::Diff;
-        self.merge_context = None;
-        self.show_merge_context = false;
-        let changed = self
-            .rows
-            .iter()
-            .filter(|line| line.kind != DiffKind::Equal)
-            .count();
-        self.status = if changed == 0 {
-            "The text panes are identical under the selected rules.".into()
-        } else {
-            format!("{changed} changed line(s)")
-        };
+        let left = self.left_content.clone();
+        let right = self.right_content.clone();
+        let options = self.compare_options();
+        self.invalidate_comparison();
+        let generation = self.comparison_generation;
+        self.status = "Comparing text...".into();
         cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let rows = cx
+                .background_executor()
+                .spawn(async move { compare_text_with_options(&left, &right, options) })
+                .await;
+            if let Err(error) = this.update(cx, |this, cx| {
+                if this.comparison_generation != generation {
+                    return;
+                }
+                this.reset_diff_input_states();
+                this.reset_diff_editor_with_rows(rows);
+                this.diff_scroll_handle
+                    .scroll_to_item(0, ScrollStrategy::Top);
+                this.folder_mode = false;
+                this.folder_entries.clear();
+                this.selected_folder_file = None;
+                this.compared = true;
+                this.active_panel = MainPanel::Diff;
+                this.merge_context = None;
+                this.show_merge_context = false;
+                let changed = this
+                    .rows
+                    .iter()
+                    .filter(|line| line.kind != DiffKind::Equal)
+                    .count();
+                this.status = if changed == 0 {
+                    "The text panes are identical under the selected rules.".into()
+                } else {
+                    format!("{changed} changed line(s)")
+                };
+                cx.notify();
+            }) {
+                eprintln!("Could not update the text comparison: {error}");
+            }
+        })
+        .detach();
     }
 
     fn refresh_text_input(&mut self, cx: &mut Context<Self>) {
-        if self.mode != Some(CompareMode::Text) || self.compared {
+        if self.mode != Some(CompareMode::Text) {
+            return;
+        }
+        self.invalidate_comparison();
+        if self.compared {
             return;
         }
         self.left_content = self.left_text_editor.read(cx).value().to_string();
@@ -896,23 +1173,16 @@ impl Checker {
         }
         self.left_content = self.left_original.clone().unwrap_or_default();
         self.right_content = self.right_original.clone().unwrap_or_default();
-        self.rows = compare_text_with_options(
-            &self.left_content,
-            &self.right_content,
-            CompareOptions {
-                ignore_whitespace: self.ignore_whitespace,
-                ignore_case: self.ignore_case,
-                ignore_comments: self.ignore_comments,
-            },
-        );
-        self.diff_projection = DiffProjection::from_rows(&self.rows);
-        self.reset_diff_editor();
         self.merge_context = None;
         self.show_merge_context = false;
         self.bookmarks.clear();
         self.selected_bookmark = None;
         self.bookmark_cursor = 0;
-        self.status = "Unsaved changes discarded; the files on disk were not changed.".into();
+        self.recompute_rows_in_background(
+            cx,
+            Some("Unsaved changes discarded; the files on disk were not changed.".into()),
+        );
+        self.status = "Discarded staged edits; refreshing the diff...".into();
         cx.notify();
     }
 
@@ -1004,137 +1274,99 @@ impl Checker {
         }
         let left = PathBuf::from(&left_path);
         let right = PathBuf::from(&right_path);
-        if self.mode == Some(CompareMode::Folder) && !(left.is_dir() && right.is_dir()) {
-            self.set_error("Folder Compare requires two existing folders.".into());
-            cx.notify();
-            return;
-        }
-        if self.mode == Some(CompareMode::File) && (left.is_dir() || right.is_dir()) {
-            self.set_error("File Compare requires two file paths, not folders.".into());
-            cx.notify();
-            return;
-        }
-        match (left.is_dir(), right.is_dir()) {
-            (true, true) => {
-                let includes = split_patterns(&self.include_patterns.read(cx).value());
-                let ignores = split_patterns(&self.ignore_patterns.read(cx).value());
-                match compare_folders(&left, &right, &includes, &ignores) {
-                    Ok(entries) => {
+        let base_path = self.base_path.read(cx).value().to_string();
+        let base = (!base_path.trim().is_empty()).then(|| PathBuf::from(base_path));
+        let includes = split_patterns(&self.include_patterns.read(cx).value());
+        let ignores = split_patterns(&self.ignore_patterns.read(cx).value());
+        let mode = self.mode;
+        let options = self.compare_options();
+        self.invalidate_comparison();
+        let generation = self.comparison_generation;
+        self.status = match mode {
+            Some(CompareMode::Folder) => "Scanning folders...".into(),
+            _ => "Comparing files...".into(),
+        };
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let result =
+                cx.background_executor()
+                    .spawn(async move {
+                        compare_paths(mode, left, right, base, includes, ignores, options)
+                    })
+                    .await;
+            if let Err(error) = this.update(cx, |this, cx| {
+                if this.comparison_generation != generation {
+                    return;
+                }
+                match result {
+                    Ok(ComparisonResult::Folder(entries)) => {
+                        this.reset_diff_input_states();
                         let total = entries.len();
                         let changed = entries
                             .iter()
                             .filter(|entry| entry.status != FolderStatus::Identical)
                             .count();
-                        self.folder_entries = entries;
-                        self.set_rows(Vec::new());
-                        self.left_content.clear();
-                        self.right_content.clear();
-                        self.left_original = None;
-                        self.right_original = None;
-                        self.base_content.clear();
-                        self.merge_context = None;
-                        self.show_merge_context = false;
-                        self.folder_mode = true;
-                        self.selected_folder_file = None;
-                        self.active_panel = MainPanel::Diff;
-                        self.compared = true;
-                        self.status = format!("{changed} differing files · {total} files shown");
+                        this.folder_entries = entries;
+                        this.set_rows(Vec::new());
+                        this.left_content.clear();
+                        this.right_content.clear();
+                        this.left_original = None;
+                        this.right_original = None;
+                        this.base_content.clear();
+                        this.merge_context = None;
+                        this.show_merge_context = false;
+                        this.folder_mode = true;
+                        this.selected_folder_file = None;
+                        this.active_panel = MainPanel::Diff;
+                        this.compared = true;
+                        this.status = format!("{changed} differing files · {total} files shown");
                     }
-                    Err(error) => self.set_error(format!("Could not compare folders: {error}")),
+                    Ok(ComparisonResult::File {
+                        left,
+                        right,
+                        base,
+                        rows,
+                        merge_context,
+                        status,
+                    }) => {
+                        this.reset_diff_input_states();
+                        this.folder_mode = false;
+                        this.folder_entries.clear();
+                        this.selected_folder_file = None;
+                        this.left_content = left.clone();
+                        this.right_content = right;
+                        this.left_original = Some(left);
+                        this.right_original = merge_context
+                            .as_ref()
+                            .map(|context| context.right.clone())
+                            .or_else(|| Some(this.right_content.clone()));
+                        this.base_content = base.unwrap_or_default();
+                        this.merge_context = merge_context;
+                        this.show_merge_context = this.merge_context.is_some();
+                        this.reset_diff_editor_with_rows(rows);
+                        this.diff_scroll_handle
+                            .scroll_to_item(0, ScrollStrategy::Top);
+                        this.status = status;
+                        this.compared = true;
+                        this.active_panel = MainPanel::Diff;
+                        this.bookmarks.clear();
+                        this.bookmark_cursor = 0;
+                        this.selected_bookmark = None;
+                    }
+                    Err(error) => this.set_error(error),
                 }
+                cx.notify();
+            }) {
+                eprintln!("Could not update the comparison results: {error}");
             }
-            (false, false) => {
-                self.folder_mode = false;
-                self.folder_entries.clear();
-                self.selected_folder_file = None;
-                self.base_content.clear();
-                let left_contents = match fs::read_to_string(&left) {
-                    Ok(contents) => contents,
-                    Err(error) => {
-                        self.set_error(format!("Could not read {left_path}: {error}"));
-                        cx.notify();
-                        return;
-                    }
-                };
-                let right_contents = match fs::read_to_string(&right) {
-                    Ok(contents) => contents,
-                    Err(error) => {
-                        self.set_error(format!("Could not read {right_path}: {error}"));
-                        cx.notify();
-                        return;
-                    }
-                };
-                self.left_content = left_contents;
-                self.right_content = right_contents;
-                self.left_original = Some(self.left_content.clone());
-                self.right_original = Some(self.right_content.clone());
-                self.merge_context = None;
-                self.show_merge_context = false;
-                let base_path = self.base_path.read(cx).value().to_string();
-                if !base_path.trim().is_empty() {
-                    match fs::read_to_string(&base_path) {
-                        Ok(base) => {
-                            self.base_content = base.clone();
-                            let merge_left = self.left_content.clone();
-                            let merge_right = self.right_content.clone();
-                            let (merged, conflicts) =
-                                merge_three_way(&base, &merge_left, &merge_right);
-                            self.merge_context = Some(MergeContext {
-                                base,
-                                left: merge_left.clone(),
-                                right: merge_right,
-                                conflicts,
-                            });
-                            self.show_merge_context = true;
-                            self.right_content = merged;
-                            self.rows = compare_text_with_options(
-                                &self.left_content,
-                                &self.right_content,
-                                self.compare_options(),
-                            );
-                            self.diff_projection = DiffProjection::from_rows(&self.rows);
-                            self.status = format!(
-                                "3-way result staged on the right · {conflicts} conflict(s)"
-                            );
-                        }
-                        Err(error) => {
-                            self.set_error(format!(
-                                "Could not read base file {base_path}: {error}"
-                            ));
-                            cx.notify();
-                            return;
-                        }
-                    }
-                } else {
-                    self.rows = compare_text_with_options(
-                        &self.left_content,
-                        &self.right_content,
-                        self.compare_options(),
-                    );
-                    self.diff_projection = DiffProjection::from_rows(&self.rows);
-                    let changed = self
-                        .rows
-                        .iter()
-                        .filter(|line| line.kind != DiffKind::Equal)
-                        .count();
-                    self.status = if changed == 0 {
-                        "The files are identical under the selected rules.".into()
-                    } else {
-                        format!("{changed} changed line(s)")
-                    };
-                }
-                self.compared = true;
-                self.active_panel = MainPanel::Diff;
-                self.bookmarks.clear();
-                self.bookmark_cursor = 0;
-                self.selected_bookmark = None;
-            }
-            _ => self.set_error("Both paths must be files or both must be folders.".into()),
-        }
-        cx.notify();
+        })
+        .detach();
     }
 
     fn set_error(&mut self, message: String) {
+        self.invalidate_comparison();
+        self.reset_diff_input_states();
         self.set_rows(Vec::new());
         self.folder_entries.clear();
         self.folder_mode = false;
@@ -1153,16 +1385,7 @@ impl Checker {
             self.ignore_case = !self.ignore_case;
         }
         if !self.left_content.is_empty() || !self.right_content.is_empty() {
-            self.rows = compare_text_with_options(
-                &self.left_content,
-                &self.right_content,
-                CompareOptions {
-                    ignore_whitespace: self.ignore_whitespace,
-                    ignore_case: self.ignore_case,
-                    ignore_comments: self.ignore_comments,
-                },
-            );
-            self.diff_projection = DiffProjection::from_rows(&self.rows);
+            self.recompute_rows_in_background(cx, None);
         }
         cx.notify();
     }
@@ -1170,16 +1393,7 @@ impl Checker {
     fn toggle_comments(&mut self, cx: &mut Context<Self>) {
         self.ignore_comments = !self.ignore_comments;
         if !self.left_content.is_empty() || !self.right_content.is_empty() {
-            self.rows = compare_text_with_options(
-                &self.left_content,
-                &self.right_content,
-                CompareOptions {
-                    ignore_whitespace: self.ignore_whitespace,
-                    ignore_case: self.ignore_case,
-                    ignore_comments: self.ignore_comments,
-                },
-            );
-            self.diff_projection = DiffProjection::from_rows(&self.rows);
+            self.recompute_rows_in_background(cx, None);
         }
         cx.notify();
     }
@@ -1269,8 +1483,8 @@ impl Checker {
         if !self.diff_editor.can_undo() {
             if let Some((side, row)) = self.last_diff_input
                 && let Some(input) = match side {
-                    DiffSide::Left => self.left_diff_inputs.get(row),
-                    DiffSide::Right => self.right_diff_inputs.get(row),
+                    DiffSide::Left => self.left_diff_inputs.get(&row),
+                    DiffSide::Right => self.right_diff_inputs.get(&row),
                 }
             {
                 input.update(cx, |state, cx| state.focus(window, cx));
@@ -1311,8 +1525,8 @@ impl Checker {
         if !self.diff_editor.can_redo() {
             if let Some((side, row)) = self.last_diff_input
                 && let Some(input) = match side {
-                    DiffSide::Left => self.left_diff_inputs.get(row),
-                    DiffSide::Right => self.right_diff_inputs.get(row),
+                    DiffSide::Left => self.left_diff_inputs.get(&row),
+                    DiffSide::Right => self.right_diff_inputs.get(&row),
                 }
             {
                 input.update(cx, |state, cx| state.focus(window, cx));
@@ -1378,56 +1592,66 @@ impl Checker {
             cx.notify();
             return;
         }
+        self.invalidate_comparison();
+        let generation = self.comparison_generation;
         let left_path = PathBuf::from(self.left_path.read(cx).value().to_string()).join(&relative);
         let right_path =
             PathBuf::from(self.right_path.read(cx).value().to_string()).join(&relative);
-        let left_original = if left_path.exists() {
-            match fs::read_to_string(&left_path) {
-                Ok(contents) => Some(contents),
-                Err(error) => {
-                    self.status =
-                        format!("Could not open {} as text: {error}", left_path.display());
-                    cx.notify();
-                    return;
-                }
-            }
-        } else {
-            None
-        };
-        let right_original = if right_path.exists() {
-            match fs::read_to_string(&right_path) {
-                Ok(contents) => Some(contents),
-                Err(error) => {
-                    self.status =
-                        format!("Could not open {} as text: {error}", right_path.display());
-                    cx.notify();
-                    return;
-                }
-            }
-        } else {
-            None
-        };
-        self.left_content = left_original.clone().unwrap_or_default();
-        self.right_content = right_original.clone().unwrap_or_default();
-        self.left_original = left_original;
-        self.right_original = right_original;
-        self.base_content.clear();
-        self.merge_context = None;
-        self.show_merge_context = false;
-        self.rows = compare_text_with_options(
-            &self.left_content,
-            &self.right_content,
-            CompareOptions {
-                ignore_whitespace: self.ignore_whitespace,
-                ignore_case: self.ignore_case,
-                ignore_comments: self.ignore_comments,
-            },
-        );
-        self.diff_projection = DiffProjection::from_rows(&self.rows);
-        self.selected_folder_file = Some(relative.clone());
-        self.active_panel = MainPanel::Diff;
-        self.status = format!("Comparing folder file: {relative}");
+        let options = self.compare_options();
+        self.status = format!("Opening folder file: {relative}...");
         cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let read_optional = |path: &PathBuf| match fs::read_to_string(path) {
+                        Ok(contents) => Ok(Some(contents)),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                        Err(error) => Err(format!(
+                            "Could not open {} as text: {error}",
+                            path.display()
+                        )),
+                    };
+                    let left = read_optional(&left_path)?;
+                    let right = read_optional(&right_path)?;
+                    let rows = compare_text_with_options(
+                        left.as_deref().unwrap_or_default(),
+                        right.as_deref().unwrap_or_default(),
+                        options,
+                    );
+                    Ok::<_, String>((left, right, rows))
+                })
+                .await;
+            if let Err(error) = this.update(cx, |this, cx| {
+                if this.comparison_generation != generation {
+                    return;
+                }
+                match result {
+                    Ok((left, right, rows)) => {
+                        this.reset_diff_input_states();
+                        this.left_content = left.clone().unwrap_or_default();
+                        this.right_content = right.clone().unwrap_or_default();
+                        this.left_original = left;
+                        this.right_original = right;
+                        this.base_content.clear();
+                        this.merge_context = None;
+                        this.show_merge_context = false;
+                        this.reset_diff_editor_with_rows(rows);
+                        this.diff_scroll_handle
+                            .scroll_to_item(0, ScrollStrategy::Top);
+                        this.selected_folder_file = Some(relative.clone());
+                        this.active_panel = MainPanel::Diff;
+                        this.status = format!("Comparing folder file: {relative}");
+                    }
+                    Err(message) => this.status = message,
+                }
+                cx.notify();
+            }) {
+                eprintln!("Could not update the folder file comparison: {error}");
+            }
+        })
+        .detach();
     }
 
     fn move_bookmark(&mut self, forward: bool, cx: &mut Context<Self>) {
@@ -2219,9 +2443,9 @@ impl Render for Checker {
                                     this.child(
                                         content.child(
                                             div()
+                                                .v_flex()
                                                 .flex_1()
                                                 .min_h_0()
-                                                .overflow_y_scrollbar()
                                                 .child(self.render_results(window, &palette, cx)),
                                         ),
                                     )
@@ -2297,9 +2521,163 @@ impl Checker {
             )
     }
 
+    fn render_diff_row(
+        &mut self,
+        index: usize,
+        first_visible_hunk_row: bool,
+        row_height: f32,
+        palette: &ThemePalette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let line = self.rows.get(index);
+        let line_kind = line.map(|line| line.kind).unwrap_or(DiffKind::Equal);
+        let (background, foreground, marker) = match line_kind {
+            DiffKind::Equal => (palette.diff_equal, palette.foreground, ""),
+            DiffKind::Changed => (palette.diff_changed, palette.diff_changed_text, "≠"),
+            DiffKind::Added => (palette.diff_added, palette.diff_added_text, "+"),
+            DiffKind::Removed => (palette.diff_removed, palette.diff_removed_text, "−"),
+        };
+        let left_number = self
+            .diff_projection
+            .source_line_for_row(DiffSide::Left, index)
+            .map(|line| (line + 1).to_string())
+            .unwrap_or_default();
+        let right_number = self
+            .diff_projection
+            .source_line_for_row(DiffSide::Right, index)
+            .map(|line| (line + 1).to_string())
+            .unwrap_or_default();
+        let left_input = self
+            .left_diff_inputs
+            .get(&index)
+            .expect("visible left diff input is initialized")
+            .clone();
+        let right_input = self
+            .right_diff_inputs
+            .get(&index)
+            .expect("visible right diff input is initialized")
+            .clone();
+        let left_input_for_focus = left_input.clone();
+        let right_input_for_focus = right_input.clone();
+        let bookmarked = self.bookmarks.contains(&index);
+
+        div()
+            .h_flex()
+            .id(index)
+            .w_full()
+            .h(px(row_height))
+            .gap(px(1.))
+            .child(diff_cell(
+                &left_number,
+                &left_input,
+                self.active_diff_input == Some((DiffSide::Left, index)),
+                background,
+                foreground,
+                self.editor_font_size,
+                palette,
+                cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                    this.handle_diff_navigation(DiffSide::Left, index, event, window, cx)
+                }),
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    if left_input_for_focus
+                        .read(cx)
+                        .input_bounds()
+                        .contains(&event.position)
+                    {
+                        this.active_diff_input = Some((DiffSide::Left, index));
+                        this.last_diff_input = Some((DiffSide::Left, index));
+                        left_input_for_focus.update(cx, |state, cx| state.focus(window, cx));
+                        cx.notify();
+                    }
+                }),
+            ))
+            .child(
+                div()
+                    .w(px(82.))
+                    .h_flex()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(1.))
+                    .bg(rgb(palette.toolbar))
+                    .child(
+                        div()
+                            .w(px(12.))
+                            .text_size(px((self.editor_font_size - 1.).max(8.)))
+                            .text_color(rgb(foreground))
+                            .child(marker),
+                    )
+                    .when(first_visible_hunk_row, |gutter| {
+                        gutter
+                            .child(
+                                Button::new(format!("copy-hunk-right-{index}"))
+                                    .ghost()
+                                    .compact()
+                                    .with_size(ComponentSize::XSmall)
+                                    .label("←")
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.copy_hunk(index, false, window, cx)
+                                    })),
+                            )
+                            .child(
+                                Button::new(format!("copy-hunk-left-{index}"))
+                                    .ghost()
+                                    .compact()
+                                    .with_size(ComponentSize::XSmall)
+                                    .label("→")
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.copy_hunk(index, true, window, cx)
+                                    })),
+                            )
+                    })
+                    .when(line_kind != DiffKind::Equal, |gutter| {
+                        gutter.child(
+                            Button::new(format!("bookmark-{index}"))
+                                .ghost()
+                                .compact()
+                                .with_size(ComponentSize::XSmall)
+                                .label(if bookmarked { "★" } else { "☆" })
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if !this.bookmarks.insert(index) {
+                                        this.bookmarks.remove(&index);
+                                        if this.selected_bookmark == Some(index) {
+                                            this.selected_bookmark = None;
+                                        }
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                    }),
+            )
+            .child(diff_cell(
+                &right_number,
+                &right_input,
+                self.active_diff_input == Some((DiffSide::Right, index)),
+                background,
+                foreground,
+                self.editor_font_size,
+                palette,
+                cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                    this.handle_diff_navigation(DiffSide::Right, index, event, window, cx)
+                }),
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    if right_input_for_focus
+                        .read(cx)
+                        .input_bounds()
+                        .contains(&event.position)
+                    {
+                        this.active_diff_input = Some((DiffSide::Right, index));
+                        this.last_diff_input = Some((DiffSide::Right, index));
+                        right_input_for_focus.update(cx, |state, cx| state.focus(window, cx));
+                        cx.notify();
+                    }
+                }),
+            ))
+            .into_any_element()
+    }
+
     fn render_results(
         &mut self,
-        window: &mut Window,
+        _window: &mut Window,
         palette: &ThemePalette,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -2456,18 +2834,6 @@ impl Checker {
                 )
                 .child(div().flex_1().min_h_0().overflow_y_scrollbar().child(list));
         }
-        self.ensure_diff_editor();
-        let query = self.search.read(cx).value().to_string().to_lowercase();
-        let mut rows = div().v_flex().min_h(px(160.)).gap(px(1.));
-        let mut visible_lines = 0;
-        let row_count = self.diff_editor_row_count();
-        let mut hunk_starts = vec![None; row_count];
-        for hunk in change_hunks(&self.rows) {
-            for row in hunk.start_row..hunk.end_row {
-                hunk_starts[row] = Some(hunk.start_row);
-            }
-        }
-        let mut shown_hunks = BTreeSet::new();
         if self.rows.is_empty() && !self.compared {
             return div()
                 .h_flex()
@@ -2477,7 +2843,19 @@ impl Checker {
                 .text_color(rgb(palette.secondary_text))
                 .child("Your comparison will appear here.");
         }
-        self.ensure_diff_inputs(window, cx);
+        self.update_visible_diff_rows(self.search.read(cx).value().to_string().to_lowercase());
+        if let Some((_, row, _)) = self.pending_diff_focus {
+            self.scroll_to_diff_row(row, cx);
+        }
+        if self.visible_diff_rows.is_empty() {
+            return div()
+                .h_flex()
+                .min_h(px(160.))
+                .items_center()
+                .justify_center()
+                .text_color(rgb(palette.secondary_text))
+                .child("No lines match this filter or search.");
+        }
         let left_label = if self.mode == Some(CompareMode::Text) {
             "LEFT TEXT".to_owned()
         } else {
@@ -2498,159 +2876,51 @@ impl Checker {
                 "RIGHT",
             )
         };
-        rows = rows.child(
-            div()
-                .h_flex()
-                .items_center()
-                .px_2()
-                .h(px(22.))
-                .bg(rgb(palette.toolbar))
-                .text_size(px(9.))
-                .text_color(rgb(palette.secondary_text))
-                .child(div().flex_1().child(left_label))
-                .child(div().w(px(82.)).justify_center().child("DIFF"))
-                .child(div().flex_1().child(right_label)),
-        );
-        for index in 0..row_count {
-            let line = self.rows.get(index);
-            let line_kind = line.map(|line| line.kind).unwrap_or(DiffKind::Equal);
-            let left_text = line.map(|line| line.left_text.as_str()).unwrap_or("");
-            let right_text = line.map(|line| line.right_text.as_str()).unwrap_or("");
-            if self.diff_filter == DiffFilter::Differences && line_kind == DiffKind::Equal
-                || self.diff_filter == DiffFilter::Same && line_kind != DiffKind::Equal
-            {
-                continue;
-            }
-            if self
-                .selected_bookmark
-                .is_some_and(|selected| selected != index)
-            {
-                continue;
-            }
-            if self.selected_bookmark.is_none()
-                && !query.is_empty()
-                && !left_text.to_lowercase().contains(&query)
-                && !right_text.to_lowercase().contains(&query)
-            {
-                continue;
-            }
-            visible_lines += 1;
-            let first_visible_hunk_row =
-                hunk_starts[index].is_some_and(|start| shown_hunks.insert(start));
-            let (background, foreground, marker) = match line_kind {
-                DiffKind::Equal => (palette.diff_equal, palette.foreground, ""),
-                DiffKind::Changed => (palette.diff_changed, palette.diff_changed_text, "≠"),
-                DiffKind::Added => (palette.diff_added, palette.diff_added_text, "+"),
-                DiffKind::Removed => (palette.diff_removed, palette.diff_removed_text, "−"),
-            };
-            let left_number = self
-                .diff_projection
-                .source_line_for_row(DiffSide::Left, index)
-                .map(|line| (line + 1).to_string())
-                .unwrap_or_default();
-            let right_number = self
-                .diff_projection
-                .source_line_for_row(DiffSide::Right, index)
-                .map(|line| (line + 1).to_string())
-                .unwrap_or_default();
-            let left_input = self.left_diff_inputs[index].clone();
-            let right_input = self.right_diff_inputs[index].clone();
-            let bookmarked = self.bookmarks.contains(&index);
-            rows = rows.child(
+        let palette = *palette;
+        let visible_rows = self.visible_diff_rows.clone();
+        let row_height = (self.editor_font_size + 8.).max(18.) + 1.;
+        div()
+            .v_flex()
+            .flex_1()
+            .min_h_0()
+            .child(
                 div()
                     .h_flex()
-                    .gap(px(1.))
-                    .child(diff_cell(
-                        &left_number,
-                        &left_input,
-                        background,
-                        foreground,
-                        self.editor_font_size,
-                        palette,
-                        cx.listener(move |this, event, window, cx| {
-                            this.handle_diff_navigation(DiffSide::Left, index, event, window, cx)
+                    .items_center()
+                    .px_2()
+                    .h(px(22.))
+                    .bg(rgb(palette.toolbar))
+                    .text_size(px(9.))
+                    .text_color(rgb(palette.secondary_text))
+                    .child(div().flex_1().child(left_label))
+                    .child(div().w(px(82.)).justify_center().child("DIFF"))
+                    .child(div().flex_1().child(right_label)),
+            )
+            .child(
+                div().relative().flex_1().min_h_0().child(
+                    uniform_list(
+                        "diff-result-rows",
+                        visible_rows.len(),
+                        cx.processor(move |this, range: Range<usize>, window, cx| {
+                            this.ensure_diff_inputs(&visible_rows, range.clone(), window, cx);
+                            range
+                                .map(|slot| {
+                                    let (row, first_hunk_row) = visible_rows[slot];
+                                    this.render_diff_row(
+                                        row,
+                                        first_hunk_row,
+                                        row_height,
+                                        &palette,
+                                        cx,
+                                    )
+                                })
+                                .collect::<Vec<_>>()
                         }),
-                    ))
-                    .child(
-                        div()
-                            .w(px(82.))
-                            .h_flex()
-                            .items_center()
-                            .justify_center()
-                            .gap(px(1.))
-                            .bg(rgb(palette.toolbar))
-                            .child(
-                                div()
-                                    .w(px(12.))
-                                    .text_size(px((self.editor_font_size - 1.).max(8.)))
-                                    .text_color(rgb(foreground))
-                                    .child(marker),
-                            )
-                            .when(first_visible_hunk_row, |gutter| {
-                                gutter
-                                    .child(
-                                        Button::new(format!("copy-hunk-right-{index}"))
-                                            .ghost()
-                                            .compact()
-                                            .with_size(ComponentSize::XSmall)
-                                            .label("←")
-                                            .on_click(cx.listener(move |this, _, window, cx| {
-                                                this.copy_hunk(index, false, window, cx)
-                                            })),
-                                    )
-                                    .child(
-                                        Button::new(format!("copy-hunk-left-{index}"))
-                                            .ghost()
-                                            .compact()
-                                            .with_size(ComponentSize::XSmall)
-                                            .label("→")
-                                            .on_click(cx.listener(move |this, _, window, cx| {
-                                                this.copy_hunk(index, true, window, cx)
-                                            })),
-                                    )
-                            })
-                            .when(line_kind != DiffKind::Equal, |gutter| {
-                                gutter.child(
-                                    Button::new(format!("bookmark-{index}"))
-                                        .ghost()
-                                        .compact()
-                                        .with_size(ComponentSize::XSmall)
-                                        .label(if bookmarked { "★" } else { "☆" })
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            if !this.bookmarks.insert(index) {
-                                                this.bookmarks.remove(&index);
-                                                if this.selected_bookmark == Some(index) {
-                                                    this.selected_bookmark = None;
-                                                }
-                                            }
-                                            cx.notify();
-                                        })),
-                                )
-                            }),
                     )
-                    .child(diff_cell(
-                        &right_number,
-                        &right_input,
-                        background,
-                        foreground,
-                        self.editor_font_size,
-                        palette,
-                        cx.listener(move |this, event, window, cx| {
-                            this.handle_diff_navigation(DiffSide::Right, index, event, window, cx)
-                        }),
-                    )),
-            );
-        }
-        if visible_lines == 0 {
-            return div()
-                .h_flex()
-                .min_h(px(160.))
-                .items_center()
-                .justify_center()
-                .text_color(rgb(palette.secondary_text))
-                .child("No lines match this filter or search.");
-        }
-        rows
+                    .track_scroll(&self.diff_scroll_handle)
+                    .size_full(),
+                ),
+            )
     }
 }
 

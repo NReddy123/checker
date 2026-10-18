@@ -1,0 +1,2 @@
+mode=gold
+state=ready

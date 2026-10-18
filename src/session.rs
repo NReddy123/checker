@@ -1,6 +1,7 @@
-use crate::diff::DiffLine;
+use crate::diff::{DiffLine, DiffProjection};
 use crate::folder::FolderEntry;
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MainPanel {
@@ -50,7 +51,8 @@ pub(crate) struct CompareSession {
     pub(crate) ignore_patterns: String,
     pub(crate) left_text: String,
     pub(crate) right_text: String,
-    pub(crate) rows: Vec<DiffLine>,
+    pub(crate) rows: Arc<[DiffLine]>,
+    pub(crate) diff_projection: Arc<DiffProjection>,
     pub(crate) folder_entries: Vec<FolderEntry>,
     pub(crate) left_content: String,
     pub(crate) right_content: String,
@@ -89,7 +91,8 @@ impl CompareSession {
             ignore_patterns: String::new(),
             left_text: String::new(),
             right_text: String::new(),
-            rows: Vec::new(),
+            rows: Arc::from([]),
+            diff_projection: Arc::new(DiffProjection::default()),
             folder_entries: Vec::new(),
             left_content: String::new(),
             right_content: String::new(),

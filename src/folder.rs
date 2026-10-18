@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
-use std::io;
+use std::fs::{self, File};
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -67,9 +67,17 @@ pub fn compare_folders(
             ) {
                 (Some(_), None) => FolderStatus::LeftOnly,
                 (None, Some(_)) => FolderStatus::RightOnly,
-                (Some(left), Some(right)) => match (fs::read(left), fs::read(right)) {
-                    (Ok(left), Ok(right)) if left == right => FolderStatus::Identical,
-                    (Ok(_), Ok(_)) => FolderStatus::Different,
+                (Some(left), Some(right)) => match (file_metadata(left), file_metadata(right)) {
+                    (Some(left_metadata), Some(right_metadata))
+                        if left_metadata.size != right_metadata.size =>
+                    {
+                        FolderStatus::Different
+                    }
+                    (Some(_), Some(_)) => match files_equal(left, right) {
+                        Ok(true) => FolderStatus::Identical,
+                        Ok(false) => FolderStatus::Different,
+                        Err(_) => FolderStatus::Unreadable,
+                    },
                     _ => FolderStatus::Unreadable,
                 },
                 (None, None) => unreachable!(),
@@ -82,6 +90,24 @@ pub fn compare_folders(
             }
         })
         .collect())
+}
+
+fn files_equal(left: &Path, right: &Path) -> io::Result<bool> {
+    let mut left = File::open(left)?;
+    let mut right = File::open(right)?;
+    let mut left_buffer = [0; 64 * 1024];
+    let mut right_buffer = [0; 64 * 1024];
+
+    loop {
+        let left_read = left.read(&mut left_buffer)?;
+        let right_read = right.read(&mut right_buffer)?;
+        if left_read != right_read || left_buffer[..left_read] != right_buffer[..right_read] {
+            return Ok(false);
+        }
+        if left_read == 0 {
+            return Ok(true);
+        }
+    }
 }
 
 fn file_metadata(path: &Path) -> Option<FileMetadata> {
@@ -314,15 +340,38 @@ mod tests {
         fs::write(right.join("same.txt"), "same").unwrap();
         fs::write(left.join("nested/change.rs"), "left").unwrap();
         fs::write(right.join("nested/change.rs"), "right").unwrap();
+        fs::write(left.join("same-size.txt"), "old").unwrap();
+        fs::write(right.join("same-size.txt"), "new").unwrap();
+        let left_large = vec![b'x'; 128 * 1024];
+        let mut right_large = left_large.clone();
+        right_large[127 * 1024] = b'y';
+        fs::write(left.join("large.bin"), &left_large).unwrap();
+        fs::write(right.join("large.bin"), &right_large).unwrap();
         fs::write(left.join("skip.log"), "hidden").unwrap();
         fs::write(left.join(".gitignore"), "*.log\n").unwrap();
 
         let entries = compare_folders(&left, &right, &[], &[]).unwrap();
-        assert_eq!(entries.len(), 3);
+        assert_eq!(entries.len(), 5);
         assert_eq!(
             entries
                 .iter()
                 .find(|entry| entry.relative_path == "nested/change.rs")
+                .unwrap()
+                .status,
+            FolderStatus::Different
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .find(|entry| entry.relative_path == "same-size.txt")
+                .unwrap()
+                .status,
+            FolderStatus::Different
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .find(|entry| entry.relative_path == "large.bin")
                 .unwrap()
                 .status,
             FolderStatus::Different

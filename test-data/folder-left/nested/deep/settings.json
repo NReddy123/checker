@@ -1,0 +1,5 @@
+{
+  "environment": "test",
+  "retries": 2,
+  "logging": true
+}

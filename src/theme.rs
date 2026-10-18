@@ -9,6 +9,7 @@ pub(crate) enum AppTheme {
     Light,
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct ThemePalette {
     pub(crate) window: u32,
     pub(crate) header: u32,
