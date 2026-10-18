@@ -73,9 +73,9 @@ impl AppTheme {
                 accent: 0x0969da,
                 status_error: 0xcf222e,
                 diff_equal: 0xffffff,
-                diff_changed: 0xfff8c5,
-                diff_added: 0xdafbe1,
-                diff_removed: 0xffebe9,
+                diff_changed: 0xfff2cc,
+                diff_added: 0xe5f3e8,
+                diff_removed: 0xfbe3e3,
                 diff_changed_text: 0x825b00,
                 diff_added_text: 0x116329,
                 diff_removed_text: 0xcf222e,
@@ -165,5 +165,23 @@ mod tests {
         assert_ne!(dark.window, light.window);
         assert_ne!(dark.diff_changed, light.diff_changed);
         assert_ne!(dark.foreground, light.foreground);
+    }
+
+    #[test]
+    fn light_diff_highlights_are_subtle_against_equal_rows() {
+        let palette = AppTheme::Light.palette();
+        for highlight in [
+            palette.diff_changed,
+            palette.diff_added,
+            palette.diff_removed,
+        ] {
+            let channel_deltas = [
+                ((highlight >> 16) & 0xff).abs_diff((palette.diff_equal >> 16) & 0xff),
+                ((highlight >> 8) & 0xff).abs_diff((palette.diff_equal >> 8) & 0xff),
+                (highlight & 0xff).abs_diff(palette.diff_equal & 0xff),
+            ];
+            let max_delta = channel_deltas.into_iter().max().unwrap();
+            assert!((24..=52).contains(&max_delta));
+        }
     }
 }
