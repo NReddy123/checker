@@ -195,9 +195,9 @@ pub fn merge_three_way(base: &str, left: &str, right: &str) -> (String, usize) {
         output
     }
 
-    let base_lines = lines(base);
-    let left_lines = lines(left);
-    let right_lines = lines(right);
+    let base_lines = merge_lines(base);
+    let left_lines = merge_lines(left);
+    let right_lines = merge_lines(right);
     let left_edits = edits(&base_lines, &left_lines);
     let right_edits = edits(&base_lines, &right_lines);
     let mut left_index = 0;
@@ -283,9 +283,10 @@ fn append_lines(output: &mut String, lines: &[String]) {
     for line in lines {
         output.push_str(line);
     }
-    if !lines.is_empty() && !output.ends_with('\n') {
-        output.push('\n');
-    }
+}
+
+fn merge_lines(text: &str) -> Vec<String> {
+    text.split_inclusive('\n').map(str::to_owned).collect()
 }
 
 #[cfg(test)]

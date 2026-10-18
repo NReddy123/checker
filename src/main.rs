@@ -2,7 +2,7 @@ mod diff;
 mod folder;
 
 use diff::{CompareOptions, DiffKind, DiffLine, compare_text_with_options, merge_three_way};
-use folder::{FolderEntry, FolderStatus, compare_folders, synchronize_folders};
+use folder::{FolderEntry, FolderStatus, compare_folders, synchronize_folders, write_folder_file};
 use gpui_kit::component::button::*;
 use gpui_kit::component::{
     input::{Input, InputState, Textarea, TextareaState},
@@ -248,6 +248,11 @@ impl Checker {
     }
 
     fn copy_file(&mut self, left_to_right: bool, cx: &mut Context<Self>) {
+        if self.folder_mode && self.selected_folder_file.is_none() {
+            self.status = "Open a folder text file before copying file contents.".into();
+            cx.notify();
+            return;
+        }
         let left_path = PathBuf::from(self.left_path.read(cx).value().to_string());
         let right_path = PathBuf::from(self.right_path.read(cx).value().to_string());
         let (contents, destination) = if left_to_right {
@@ -267,6 +272,11 @@ impl Checker {
     }
 
     fn save_editor(&mut self, cx: &mut Context<Self>) {
+        if self.folder_mode && self.selected_folder_file.is_none() {
+            self.status = "Open a folder text file before saving the editor.".into();
+            cx.notify();
+            return;
+        }
         let root = PathBuf::from(self.right_path.read(cx).value().to_string());
         let contents = self.editor.read(cx).value().to_string();
         let result = match &self.selected_folder_file {
@@ -291,12 +301,7 @@ impl Checker {
         cx.notify();
     }
 
-    fn open_folder_file(
-        &mut self,
-        relative: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn open_folder_file(&mut self, relative: String, window: &mut Window, cx: &mut Context<Self>) {
         let left_path = PathBuf::from(self.left_path.read(cx).value().to_string()).join(&relative);
         let right_path =
             PathBuf::from(self.right_path.read(cx).value().to_string()).join(&relative);
@@ -304,7 +309,8 @@ impl Checker {
             match fs::read_to_string(&left_path) {
                 Ok(contents) => contents,
                 Err(error) => {
-                    self.status = format!("Could not open {} as text: {error}", left_path.display());
+                    self.status =
+                        format!("Could not open {} as text: {error}", left_path.display());
                     cx.notify();
                     return;
                 }
@@ -789,39 +795,6 @@ fn split_patterns(value: &str) -> Vec<String> {
         .collect()
 }
 
-fn write_folder_file(root: &PathBuf, relative: &str, contents: &str) -> std::io::Result<()> {
-    let relative = std::path::Path::new(relative);
-    if relative.is_absolute()
-        || relative
-            .components()
-            .any(|component| !matches!(component, std::path::Component::Normal(_)))
-    {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "invalid relative file path",
-        ));
-    }
-    let canonical_root = fs::canonicalize(root)?;
-    let destination = root.join(relative);
-    let parent = destination.parent().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid destination")
-    })?;
-    fs::create_dir_all(parent)?;
-    if !fs::canonicalize(parent)?.starts_with(canonical_root) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "destination resolves outside the selected folder",
-        ));
-    }
-    if fs::symlink_metadata(&destination).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "refusing to overwrite a symbolic link",
-        ));
-    }
-    fs::write(destination, contents)
-}
-
 fn path_input(title: &str, state: &Entity<InputState>) -> impl IntoElement {
     div()
         .v_flex()
@@ -934,9 +907,9 @@ fn syntax_colors_for(text: &str, base_color: u32) -> Vec<u32> {
     }
     let keywords = [
         "as", "async", "await", "break", "class", "const", "continue", "def", "else", "enum",
-        "false", "fn", "for", "func", "if", "import", "in", "let", "match", "mut", "new",
-        "None", "null", "pub", "return", "self", "static", "struct", "True", "true", "type",
-        "use", "var", "while",
+        "false", "fn", "for", "func", "if", "import", "in", "let", "match", "mut", "new", "None",
+        "null", "pub", "return", "self", "static", "struct", "True", "true", "type", "use", "var",
+        "while",
     ];
     let mut index = 0;
     while index < characters.len() {

@@ -72,19 +72,14 @@ pub fn synchronize_folders(
     destination: &Path,
     entries: &[FolderEntry],
 ) -> io::Result<usize> {
-    let destination_root = fs::canonicalize(destination)?;
     let mut copied = 0;
     for entry in entries {
         let relative = Path::new(&entry.relative_path);
-        if relative.is_absolute()
-            || relative
-                .components()
-                .any(|component| !matches!(component, std::path::Component::Normal(_)))
-        {
-            continue;
-        }
-        let source_file = source.join(relative);
-        let destination_file = destination.join(relative);
+        let source_file = match checked_file_path(source, relative, false) {
+            Ok(path) => path,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
         let source_metadata = match fs::symlink_metadata(&source_file) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
@@ -93,35 +88,89 @@ pub fn synchronize_folders(
         if !source_metadata.is_file() || source_metadata.file_type().is_symlink() {
             continue;
         }
-        if fs::symlink_metadata(&destination_file)
-            .is_ok_and(|metadata| metadata.file_type().is_symlink())
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "refusing to overwrite a symbolic link in the destination",
-            ));
-        }
+        let destination_file = checked_file_path(destination, relative, true)?;
         let source_bytes = fs::read(&source_file)?;
         if fs::read(&destination_file)
             .is_ok_and(|destination_bytes| destination_bytes == source_bytes)
         {
             continue;
         }
-        let parent = destination_file
-            .parent()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid destination"))?;
-        fs::create_dir_all(parent)?;
-        let canonical_parent = fs::canonicalize(parent)?;
-        if !canonical_parent.starts_with(&destination_root) {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "destination resolves outside the selected folder",
-            ));
-        }
         fs::copy(source_file, destination_file)?;
         copied += 1;
     }
     Ok(copied)
+}
+
+pub fn write_folder_file(root: &Path, relative: &str, contents: &str) -> io::Result<()> {
+    let relative = Path::new(relative);
+    let destination = checked_file_path(root, relative, true)?;
+    fs::write(destination, contents)
+}
+
+fn checked_file_path(root: &Path, relative: &Path, create_parents: bool) -> io::Result<PathBuf> {
+    if relative.as_os_str().is_empty()
+        || relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid relative file path",
+        ));
+    }
+    let canonical_root = fs::canonicalize(root)?;
+    let mut parent = canonical_root.clone();
+    let components: Vec<_> = relative.components().collect();
+    for component in &components[..components.len() - 1] {
+        let std::path::Component::Normal(name) = component else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid relative file path",
+            ));
+        };
+        parent.push(name);
+        match fs::symlink_metadata(&parent) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "refusing to follow a symbolic link",
+                ));
+            }
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "a parent path is not a directory",
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound && create_parents => {
+                fs::create_dir(&parent)?;
+            }
+            Err(error) => return Err(error),
+        }
+        parent = fs::canonicalize(parent)?;
+        if !parent.starts_with(&canonical_root) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "path resolves outside the selected folder",
+            ));
+        }
+    }
+    let std::path::Component::Normal(name) = components[components.len() - 1] else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid relative file path",
+        ));
+    };
+    let file = parent.join(name);
+    if fs::symlink_metadata(&file).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "refusing to follow a symbolic link",
+        ));
+    }
+    Ok(file)
 }
 
 fn collect_files(
@@ -178,7 +227,11 @@ fn is_ignored(path: &str, patterns: &[String]) -> bool {
                         .join("/"),
                 )
             })
-            || pattern.ends_with('/') && path.starts_with(pattern.trim_end_matches('/'))
+            || pattern.ends_with('/')
+                && (path == pattern.trim_end_matches('/')
+                    || path
+                        .strip_prefix(pattern.trim_end_matches('/'))
+                        .is_some_and(|suffix| suffix.starts_with('/')))
     })
 }
 
@@ -240,8 +293,15 @@ mod tests {
         fs::write(left.join(".gitignore"), "*.log\n").unwrap();
 
         let entries = compare_folders(&left, &right, &[], &[]).unwrap();
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].status, FolderStatus::Different);
+        assert_eq!(entries.len(), 3);
+        assert_eq!(
+            entries
+                .iter()
+                .find(|entry| entry.relative_path == "nested/change.rs")
+                .unwrap()
+                .status,
+            FolderStatus::Different
+        );
         let filtered = compare_folders(&left, &right, &["*.rs".into()], &[]).unwrap();
         assert_eq!(filtered.len(), 1);
 
@@ -259,6 +319,32 @@ mod tests {
         let entries = compare_folders(&left, &right, &[], &[]).unwrap();
         assert_eq!(synchronize_folders(&left, &right, &entries).unwrap(), 1);
         assert_eq!(fs::read_to_string(right.join("file.txt")).unwrap(), "new");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn synchronization_does_not_follow_destination_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_root();
+        let left = root.join("left");
+        let right = root.join("right");
+        let outside = root.join("outside");
+        fs::create_dir_all(left.join("linked")).unwrap();
+        fs::create_dir_all(&right).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(left.join("linked/file.txt"), "contents").unwrap();
+        symlink(&outside, right.join("linked")).unwrap();
+        let entries = compare_folders(&left, &right, &[], &[]).unwrap();
+
+        assert!(
+            synchronize_folders(&left, &right, &entries)
+                .unwrap_err()
+                .to_string()
+                .contains("symbolic link")
+        );
+        assert!(!outside.join("file.txt").exists());
         fs::remove_dir_all(root).unwrap();
     }
 }

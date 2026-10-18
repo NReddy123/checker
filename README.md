@@ -13,9 +13,10 @@ cargo run
 Enter two file paths or two folder paths and select **Compare**. For folders,
 Checker lists files recursively and reports left-only, right-only, identical,
 changed, or unreadable files. The include and ignore fields accept comma-
-separated `*`/`?` path patterns; `.git` folders and patterns in either root's
-`.gitignore` are also ignored. Folder synchronization copies files from the
-chosen side to the other without deleting destination-only files.
+separated `*`/`?` path patterns; `.git` folders and simple patterns in either
+root's `.gitignore` are also ignored. Select **Open text** beside a listed file
+to inspect its line diff. Folder synchronization copies files from the chosen
+side to the other without deleting destination-only files.
 
 For text comparisons, use the whitespace, case, and comment toggles to control
 line matching. Search filters visible diff rows, and the star controls let you
