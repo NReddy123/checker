@@ -31,7 +31,11 @@ pub fn compare_folders(
     let mut right_files = BTreeMap::new();
     collect_files(left, left, &ignored, &mut left_files)?;
     collect_files(right, right, &ignored, &mut right_files)?;
-    let paths: BTreeSet<_> = left_files.keys().chain(right_files.keys()).cloned().collect();
+    let paths: BTreeSet<_> = left_files
+        .keys()
+        .chain(right_files.keys())
+        .cloned()
+        .collect();
 
     Ok(paths
         .into_iter()
@@ -42,7 +46,10 @@ pub fn compare_folders(
                     .any(|pattern| wildcard_matches(pattern, path))
         })
         .map(|relative_path| {
-            let status = match (left_files.get(&relative_path), right_files.get(&relative_path)) {
+            let status = match (
+                left_files.get(&relative_path),
+                right_files.get(&relative_path),
+            ) {
                 (Some(_), None) => FolderStatus::LeftOnly,
                 (None, Some(_)) => FolderStatus::RightOnly,
                 (Some(left), Some(right)) => match (fs::read(left), fs::read(right)) {
@@ -95,7 +102,8 @@ pub fn synchronize_folders(
             ));
         }
         let source_bytes = fs::read(&source_file)?;
-        if fs::read(&destination_file).is_ok_and(|destination_bytes| destination_bytes == source_bytes)
+        if fs::read(&destination_file)
+            .is_ok_and(|destination_bytes| destination_bytes == source_bytes)
         {
             continue;
         }
@@ -160,12 +168,17 @@ fn is_ignored(path: &str, patterns: &[String]) -> bool {
     patterns.iter().any(|pattern| {
         let pattern = pattern.trim_start_matches('/');
         wildcard_matches(pattern, path)
-            || path
-                .split('/')
-                .enumerate()
-                .any(|(index, _)| wildcard_matches(pattern, &path.split('/').take(index + 1).collect::<Vec<_>>().join("/")))
-            || pattern.ends_with('/')
-                && path.starts_with(pattern.trim_end_matches('/'))
+            || path.split('/').enumerate().any(|(index, _)| {
+                wildcard_matches(
+                    pattern,
+                    &path
+                        .split('/')
+                        .take(index + 1)
+                        .collect::<Vec<_>>()
+                        .join("/"),
+                )
+            })
+            || pattern.ends_with('/') && path.starts_with(pattern.trim_end_matches('/'))
     })
 }
 

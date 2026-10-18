@@ -28,6 +28,7 @@ struct Checker {
     left_content: String,
     right_content: String,
     folder_mode: bool,
+    selected_folder_file: Option<String>,
     compared: bool,
     ignore_whitespace: bool,
     ignore_case: bool,
@@ -45,21 +46,22 @@ impl Checker {
                 .new(|cx| InputState::new(window, cx).placeholder("First file or folder path")),
             right_path: cx
                 .new(|cx| InputState::new(window, cx).placeholder("Second file or folder path")),
-            base_path: cx
-                .new(|cx| InputState::new(window, cx).placeholder("Optional base file for 3-way merge")),
+            base_path: cx.new(|cx| {
+                InputState::new(window, cx).placeholder("Optional base file for 3-way merge")
+            }),
             search: cx.new(|cx| InputState::new(window, cx).placeholder("Find in diff")),
             include_patterns: cx.new(|cx| {
                 InputState::new(window, cx).placeholder("Include globs, comma separated")
             }),
-            ignore_patterns: cx.new(|cx| {
-                InputState::new(window, cx).placeholder("Ignore globs, comma separated")
-            }),
+            ignore_patterns: cx
+                .new(|cx| InputState::new(window, cx).placeholder("Ignore globs, comma separated")),
             editor: cx.new(|cx| TextareaState::new(window, cx)),
             rows: Vec::new(),
             folder_entries: Vec::new(),
             left_content: String::new(),
             right_content: String::new(),
             folder_mode: false,
+            selected_folder_file: None,
             compared: false,
             ignore_whitespace: false,
             ignore_case: false,
@@ -95,6 +97,7 @@ impl Checker {
                         self.folder_entries = entries;
                         self.rows.clear();
                         self.folder_mode = true;
+                        self.selected_folder_file = None;
                         self.compared = true;
                         self.status = format!("{changed} differing files · {total} files shown");
                     }
@@ -104,6 +107,7 @@ impl Checker {
             (false, false) => {
                 self.folder_mode = false;
                 self.folder_entries.clear();
+                self.selected_folder_file = None;
                 let left_contents = match fs::read_to_string(&left) {
                     Ok(contents) => contents,
                     Err(error) => {
@@ -137,24 +141,24 @@ impl Checker {
                         Ok(base) => {
                             let (merged, conflicts) =
                                 merge_three_way(&base, &self.left_content, &self.right_content);
-                            self.editor.update(cx, |state, cx| {
-                                state.set_value(merged, window, cx)
-                            });
+                            self.editor
+                                .update(cx, |state, cx| state.set_value(merged, window, cx));
                             self.status = format!(
                                 "3-way merge prepared · {conflicts} conflict(s); review the editable result below"
                             );
                         }
                         Err(error) => {
-                            self.set_error(format!("Could not read base file {base_path}: {error}"));
+                            self.set_error(format!(
+                                "Could not read base file {base_path}: {error}"
+                            ));
                             cx.notify();
                             return;
                         }
                     }
                 } else {
                     let right_content = self.right_content.clone();
-                    self.editor.update(cx, |state, cx| {
-                        state.set_value(right_content, window, cx)
-                    });
+                    self.editor
+                        .update(cx, |state, cx| state.set_value(right_content, window, cx));
                     let changed = self
                         .rows
                         .iter()
@@ -179,6 +183,8 @@ impl Checker {
     fn set_error(&mut self, message: String) {
         self.rows.clear();
         self.folder_entries.clear();
+        self.folder_mode = false;
+        self.selected_folder_file = None;
         self.compared = false;
         self.status = message;
     }
@@ -220,6 +226,11 @@ impl Checker {
     }
 
     fn sync_folders(&mut self, left_to_right: bool, cx: &mut Context<Self>) {
+        if !self.folder_mode {
+            self.status = "Enter and compare two folders before synchronizing.".into();
+            cx.notify();
+            return;
+        }
         let left = PathBuf::from(self.left_path.read(cx).value().to_string());
         let right = PathBuf::from(self.right_path.read(cx).value().to_string());
         let (source, destination) = if left_to_right {
@@ -244,7 +255,11 @@ impl Checker {
         } else {
             (&self.right_content, left_path)
         };
-        match fs::write(destination, contents) {
+        let result = match &self.selected_folder_file {
+            Some(relative) => write_folder_file(&destination, relative, contents),
+            None => fs::write(destination, contents),
+        };
+        match result {
             Ok(()) => self.status = "Copied the full file. Compare again to refresh.".into(),
             Err(error) => self.status = format!("Could not copy file: {error}"),
         }
@@ -252,9 +267,13 @@ impl Checker {
     }
 
     fn save_editor(&mut self, cx: &mut Context<Self>) {
-        let path = self.right_path.read(cx).value().to_string();
+        let root = PathBuf::from(self.right_path.read(cx).value().to_string());
         let contents = self.editor.read(cx).value().to_string();
-        match fs::write(path, contents) {
+        let result = match &self.selected_folder_file {
+            Some(relative) => write_folder_file(&root, relative, &contents),
+            None => fs::write(root, contents),
+        };
+        match result {
             Ok(()) => self.status = "Saved the edited/merged text to the right-side file.".into(),
             Err(error) => self.status = format!("Could not save edited text: {error}"),
         }
@@ -272,6 +291,59 @@ impl Checker {
         cx.notify();
     }
 
+    fn open_folder_file(
+        &mut self,
+        relative: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let left_path = PathBuf::from(self.left_path.read(cx).value().to_string()).join(&relative);
+        let right_path =
+            PathBuf::from(self.right_path.read(cx).value().to_string()).join(&relative);
+        let left = if left_path.exists() {
+            match fs::read_to_string(&left_path) {
+                Ok(contents) => contents,
+                Err(error) => {
+                    self.status = format!("Could not open {} as text: {error}", left_path.display());
+                    cx.notify();
+                    return;
+                }
+            }
+        } else {
+            String::new()
+        };
+        let right = if right_path.exists() {
+            match fs::read_to_string(&right_path) {
+                Ok(contents) => contents,
+                Err(error) => {
+                    self.status =
+                        format!("Could not open {} as text: {error}", right_path.display());
+                    cx.notify();
+                    return;
+                }
+            }
+        } else {
+            String::new()
+        };
+        self.left_content = left;
+        self.right_content = right;
+        self.rows = compare_text_with_options(
+            &self.left_content,
+            &self.right_content,
+            CompareOptions {
+                ignore_whitespace: self.ignore_whitespace,
+                ignore_case: self.ignore_case,
+                ignore_comments: self.ignore_comments,
+            },
+        );
+        let right_content = self.right_content.clone();
+        self.editor
+            .update(cx, |state, cx| state.set_value(right_content, window, cx));
+        self.selected_folder_file = Some(relative.clone());
+        self.status = format!("Comparing folder file: {relative}");
+        cx.notify();
+    }
+
     fn move_bookmark(&mut self, forward: bool, cx: &mut Context<Self>) {
         if self.bookmarks.is_empty() {
             self.status = "Bookmark a diff row first.".into();
@@ -280,7 +352,9 @@ impl Checker {
             self.bookmark_cursor = if forward {
                 (self.bookmark_cursor + 1) % indices.len()
             } else {
-                self.bookmark_cursor.checked_sub(1).unwrap_or(indices.len() - 1)
+                self.bookmark_cursor
+                    .checked_sub(1)
+                    .unwrap_or(indices.len() - 1)
             };
             self.selected_bookmark = Some(indices[self.bookmark_cursor]);
             self.status = format!(
@@ -512,13 +586,14 @@ impl Render for Checker {
 }
 
 impl Checker {
-    fn render_results(
-        &self,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    fn render_results(&self, cx: &mut Context<Self>) -> impl IntoElement {
         if self.folder_mode {
             let mut list = div().v_flex().gap(px(1.));
-            for entry in &self.folder_entries {
+            let query = self.search.read(cx).value().to_string().to_lowercase();
+            for (index, entry) in self.folder_entries.iter().enumerate() {
+                if !query.is_empty() && !entry.relative_path.to_lowercase().contains(&query) {
+                    continue;
+                }
                 let (label, color) = match entry.status {
                     FolderStatus::LeftOnly => ("Left only", 0xd1a96b),
                     FolderStatus::RightOnly => ("Right only", 0x73a7ff),
@@ -534,14 +609,24 @@ impl Checker {
                         .py_1()
                         .bg(rgb(0x171b21))
                         .child(div().flex_1().child(entry.relative_path.clone()))
-                        .child(
-                            div()
-                                .text_color(rgb(color))
-                                .child(label),
-                        ),
+                        .child(div().text_color(rgb(color)).child(label)),
+                );
+                list = list.child(
+                    Button::new(format!("open-folder-file-{index}"))
+                        .label("Open text")
+                        .on_click(cx.listener({
+                            let relative = entry.relative_path.clone();
+                            move |this, _, window, cx| {
+                                this.open_folder_file(relative.clone(), window, cx)
+                            }
+                        })),
                 );
             }
-            return div().child(list);
+            let mut result = div().v_flex().gap_2().child(list);
+            if self.selected_folder_file.is_some() {
+                result = result.child(self.render_folder_detail(cx));
+            }
+            return result;
         }
         let query = self.search.read(cx).value().to_string().to_lowercase();
         let mut rows = div().v_flex().min_h(px(160.)).gap(px(1.));
@@ -565,7 +650,8 @@ impl Checker {
             {
                 continue;
             }
-            if !query.is_empty()
+            if self.selected_bookmark.is_none()
+                && !query.is_empty()
                 && !line.left_text.to_lowercase().contains(&query)
                 && !line.right_text.to_lowercase().contains(&query)
             {
@@ -581,8 +667,11 @@ impl Checker {
             let right_number = line.right_number.map(|n| n.to_string()).unwrap_or_default();
             let left_text = line.left_text.clone();
             let right_text = line.right_text.clone();
-            let left_comparison = line.right_text.clone();
-            let right_comparison = line.left_text.clone();
+            let (left_comparison, right_comparison) = if line.kind == DiffKind::Changed {
+                (line.right_text.clone(), line.left_text.clone())
+            } else {
+                (left_text.clone(), right_text.clone())
+            };
             let bookmarked = self.bookmarks.contains(&index);
             rows = rows.child(
                 div()
@@ -612,6 +701,9 @@ impl Checker {
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 if !this.bookmarks.insert(index) {
                                     this.bookmarks.remove(&index);
+                                    if this.selected_bookmark == Some(index) {
+                                        this.selected_bookmark = None;
+                                    }
                                 }
                                 cx.notify();
                             })),
@@ -634,6 +726,58 @@ impl Checker {
             )
             .child(rows)
     }
+
+    fn render_folder_detail(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let query = self.search.read(cx).value().to_string().to_lowercase();
+        let mut rows = div().v_flex().gap(px(1.));
+        for line in &self.rows {
+            if !query.is_empty()
+                && !line.left_text.to_lowercase().contains(&query)
+                && !line.right_text.to_lowercase().contains(&query)
+            {
+                continue;
+            }
+            let (background, foreground, marker) = match line.kind {
+                DiffKind::Equal => (0x171b21, 0xc8ced8, " "),
+                DiffKind::Changed => (0x3a3022, 0xf2d19a, "±"),
+                DiffKind::Added => (0x183027, 0xa9ebcb, "+"),
+                DiffKind::Removed => (0x382326, 0xf0b1b1, "−"),
+            };
+            rows = rows.child(
+                div()
+                    .h_flex()
+                    .gap(px(1.))
+                    .child(diff_cell(
+                        &line.left_number.map(|n| n.to_string()).unwrap_or_default(),
+                        &line.left_text,
+                        &line.right_text,
+                        marker,
+                        background,
+                        foreground,
+                        true,
+                    ))
+                    .child(diff_cell(
+                        &line.right_number.map(|n| n.to_string()).unwrap_or_default(),
+                        &line.right_text,
+                        &line.left_text,
+                        marker,
+                        background,
+                        foreground,
+                        false,
+                    )),
+            );
+        }
+        div()
+            .v_flex()
+            .gap_2()
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(rgb(0x929baa))
+                    .child(self.selected_folder_file.clone().unwrap_or_default()),
+            )
+            .child(rows)
+    }
 }
 
 fn split_patterns(value: &str) -> Vec<String> {
@@ -643,6 +787,39 @@ fn split_patterns(value: &str) -> Vec<String> {
         .filter(|pattern| !pattern.is_empty())
         .map(str::to_owned)
         .collect()
+}
+
+fn write_folder_file(root: &PathBuf, relative: &str, contents: &str) -> std::io::Result<()> {
+    let relative = std::path::Path::new(relative);
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid relative file path",
+        ));
+    }
+    let canonical_root = fs::canonicalize(root)?;
+    let destination = root.join(relative);
+    let parent = destination.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid destination")
+    })?;
+    fs::create_dir_all(parent)?;
+    if !fs::canonicalize(parent)?.starts_with(canonical_root) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "destination resolves outside the selected folder",
+        ));
+    }
+    if fs::symlink_metadata(&destination).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "refusing to overwrite a symbolic link",
+        ));
+    }
+    fs::write(destination, contents)
 }
 
 fn path_input(title: &str, state: &Entity<InputState>) -> impl IntoElement {
@@ -710,32 +887,23 @@ fn highlighted_text(
             _ => true,
         };
         let is_changed = change.tag() != ChangeTag::Equal;
-        changed.extend(change.value().chars().filter(|_| visible).map(|c| (c, is_changed)));
+        changed.extend(
+            change
+                .value()
+                .chars()
+                .filter(|_| visible)
+                .map(|c| (c, is_changed)),
+        );
     }
-    let is_comment = text.trim_start().starts_with("//")
-        || text.trim_start().starts_with('#')
-        || text.trim_start().starts_with("--");
+    let syntax_colors = syntax_colors_for(text, base_color);
     let mut rendered = div().h_flex().flex_1().text_size(px(12.));
     let mut buffer = String::new();
     let mut active_color = None;
-    for (character, is_changed) in changed {
+    for (index, (character, is_changed)) in changed.into_iter().enumerate() {
         let color = if is_changed {
             if left_side { 0xffc2a1 } else { 0xa7efc8 }
-        } else if is_comment {
-            0x82909e
-        } else if matches!(character, '"' | '\'') {
-            0xd6a8f5
-        } else if text.trim_start().starts_with("fn ")
-            || text.trim_start().starts_with("pub ")
-            || text.trim_start().starts_with("let ")
-            || text.trim_start().starts_with("use ")
-            || text.trim_start().starts_with("def ")
-            || text.trim_start().starts_with("class ")
-            || text.trim_start().starts_with("return ")
-        {
-            0x83baff
         } else {
-            base_color
+            syntax_colors.get(index).copied().unwrap_or(base_color)
         };
         if active_color.is_some_and(|active| active != color) {
             let previous = active_color.unwrap();
@@ -752,6 +920,65 @@ fn highlighted_text(
         rendered = rendered.child(div().text_color(rgb(color)).child(buffer));
     }
     rendered
+}
+
+fn syntax_colors_for(text: &str, base_color: u32) -> Vec<u32> {
+    let characters: Vec<char> = text.chars().collect();
+    let mut colors = vec![base_color; characters.len()];
+    if text.trim_start().starts_with("//")
+        || text.trim_start().starts_with('#')
+        || text.trim_start().starts_with("--")
+    {
+        colors.fill(0x82909e);
+        return colors;
+    }
+    let keywords = [
+        "as", "async", "await", "break", "class", "const", "continue", "def", "else", "enum",
+        "false", "fn", "for", "func", "if", "import", "in", "let", "match", "mut", "new",
+        "None", "null", "pub", "return", "self", "static", "struct", "True", "true", "type",
+        "use", "var", "while",
+    ];
+    let mut index = 0;
+    while index < characters.len() {
+        if characters[index] == '"' || characters[index] == '\'' {
+            let quote = characters[index];
+            let start = index;
+            index += 1;
+            while index < characters.len() {
+                if characters[index] == '\\' {
+                    index = (index + 2).min(characters.len());
+                } else if characters[index] == quote {
+                    index += 1;
+                    break;
+                } else {
+                    index += 1;
+                }
+            }
+            colors[start..index].fill(0xd6a8f5);
+        } else if characters[index..].starts_with(&['/', '/'])
+            || characters[index] == '#'
+            || characters[index..].starts_with(&['-', '-'])
+        {
+            colors[index..].fill(0x82909e);
+            break;
+        } else if characters[index].is_alphanumeric() || characters[index] == '_' {
+            let start = index;
+            while index < characters.len()
+                && (characters[index].is_alphanumeric() || characters[index] == '_')
+            {
+                index += 1;
+            }
+            let word: String = characters[start..index].iter().collect();
+            if keywords.contains(&word.as_str()) {
+                colors[start..index].fill(0x83baff);
+            } else if word.chars().all(|character| character.is_ascii_digit()) {
+                colors[start..index].fill(0xe9c778);
+            }
+        } else {
+            index += 1;
+        }
+    }
+    colors
 }
 
 fn main() {

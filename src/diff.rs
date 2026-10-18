@@ -25,6 +25,7 @@ pub struct CompareOptions {
     pub ignore_comments: bool,
 }
 
+#[cfg(test)]
 pub fn compare_text(left: &str, right: &str) -> Vec<DiffLine> {
     compare_text_with_options(left, right, CompareOptions::default())
 }
@@ -44,8 +45,10 @@ pub fn compare_text_with_options(
         .iter()
         .map(|line| comparison_key(line, options))
         .collect();
+    let left_refs: Vec<_> = left_keys.iter().map(String::as_str).collect();
+    let right_refs: Vec<_> = right_keys.iter().map(String::as_str).collect();
 
-    let raw: Vec<_> = TextDiff::from_slices(&left_keys, &right_keys)
+    let raw: Vec<_> = TextDiff::from_slices(&left_refs, &right_refs)
         .iter_all_changes()
         .map(|change| {
             let left_index = change.old_index();
@@ -158,7 +161,9 @@ pub fn merge_three_way(base: &str, left: &str, right: &str) -> (String, usize) {
         replacement: Vec<String>,
     }
     fn edits(base: &[String], variant: &[String]) -> Vec<Edit> {
-        TextDiff::from_slices(base, variant)
+        let base_refs: Vec<_> = base.iter().map(String::as_str).collect();
+        let variant_refs: Vec<_> = variant.iter().map(String::as_str).collect();
+        TextDiff::from_slices(&base_refs, &variant_refs)
             .ops()
             .iter()
             .filter(|operation| operation.tag() != similar::DiffTag::Equal)
@@ -285,7 +290,9 @@ fn append_lines(output: &mut String, lines: &[String]) {
 
 #[cfg(test)]
 mod tests {
-    use super::{CompareOptions, DiffKind, compare_text, compare_text_with_options, merge_three_way};
+    use super::{
+        CompareOptions, DiffKind, compare_text, compare_text_with_options, merge_three_way,
+    };
 
     #[test]
     fn aligns_insertions_without_marking_unchanged_lines_as_different() {
