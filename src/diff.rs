@@ -13,6 +13,7 @@ pub struct DiffLine {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DiffKind {
     Equal,
+    Changed,
     Added,
     Removed,
 }
@@ -44,7 +45,7 @@ pub fn compare_text_with_options(
         .map(|line| comparison_key(line, options))
         .collect();
 
-    TextDiff::from_slices(&left_keys, &right_keys)
+    let raw: Vec<_> = TextDiff::from_slices(&left_keys, &right_keys)
         .iter_all_changes()
         .map(|change| {
             let left_index = change.old_index();
@@ -75,7 +76,45 @@ pub fn compare_text_with_options(
                 kind,
             }
         })
-        .collect()
+        .collect();
+
+    let mut paired = Vec::with_capacity(raw.len());
+    let mut index = 0;
+    while index < raw.len() {
+        if raw[index].kind == DiffKind::Equal {
+            paired.push(raw[index].clone());
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index < raw.len() && raw[index].kind != DiffKind::Equal {
+            index += 1;
+        }
+        let deletions: Vec<_> = raw[start..index]
+            .iter()
+            .filter(|line| line.kind == DiffKind::Removed)
+            .cloned()
+            .collect();
+        let additions: Vec<_> = raw[start..index]
+            .iter()
+            .filter(|line| line.kind == DiffKind::Added)
+            .cloned()
+            .collect();
+        let shared = deletions.len().min(additions.len());
+        for (removed, added) in deletions.iter().zip(&additions).take(shared) {
+            paired.push(DiffLine {
+                left_number: removed.left_number,
+                right_number: added.right_number,
+                text: removed.left_text.clone(),
+                left_text: removed.left_text.clone(),
+                right_text: added.right_text.clone(),
+                kind: DiffKind::Changed,
+            });
+        }
+        paired.extend(deletions.into_iter().skip(shared));
+        paired.extend(additions.into_iter().skip(shared));
+    }
+    paired
 }
 
 fn lines(text: &str) -> Vec<String> {
@@ -111,28 +150,137 @@ pub fn merge_three_way(base: &str, left: &str, right: &str) -> (String, usize) {
     if right == base {
         return (left.to_owned(), 0);
     }
-    (
-        format!(
-            "<<<<<<< LEFT\n{}{}=======\n{}{}>>>>>>> RIGHT\n",
-            ensure_trailing_newline(left),
-            if left.is_empty() || left.ends_with('\n') {
-                ""
-            } else {
-                "\n"
-            },
-            ensure_trailing_newline(right),
-            if right.is_empty() || right.ends_with('\n') {
-                ""
-            } else {
-                "\n"
+
+    #[derive(Clone)]
+    struct Edit {
+        start: usize,
+        end: usize,
+        replacement: Vec<String>,
+    }
+    fn edits(base: &[String], variant: &[String]) -> Vec<Edit> {
+        TextDiff::from_slices(base, variant)
+            .ops()
+            .iter()
+            .filter(|operation| operation.tag() != similar::DiffTag::Equal)
+            .map(|operation| Edit {
+                start: operation.old_range().start,
+                end: operation.old_range().end,
+                replacement: variant[operation.new_range()].to_vec(),
+            })
+            .collect()
+    }
+    fn overlaps(start: usize, end: usize, edit: &Edit) -> bool {
+        if start == end {
+            edit.start == start
+        } else if edit.start == edit.end {
+            edit.start >= start && edit.start < end
+        } else {
+            edit.start < end && edit.end > start
+        }
+    }
+    fn apply_segment(base: &[String], start: usize, end: usize, edits: &[Edit]) -> Vec<String> {
+        let mut output = Vec::new();
+        let mut cursor = start;
+        for edit in edits {
+            output.extend_from_slice(&base[cursor..edit.start]);
+            output.extend(edit.replacement.iter().cloned());
+            cursor = edit.end;
+        }
+        output.extend_from_slice(&base[cursor..end]);
+        output
+    }
+
+    let base_lines = lines(base);
+    let left_lines = lines(left);
+    let right_lines = lines(right);
+    let left_edits = edits(&base_lines, &left_lines);
+    let right_edits = edits(&base_lines, &right_lines);
+    let mut left_index = 0;
+    let mut right_index = 0;
+    let mut base_cursor = 0;
+    let mut output = String::new();
+    let mut conflicts = 0;
+
+    while left_index < left_edits.len() || right_index < right_edits.len() {
+        let next_left = left_edits.get(left_index);
+        let next_right = right_edits.get(right_index);
+        let start = match (next_left, next_right) {
+            (Some(left), Some(right)) => left.start.min(right.start),
+            (Some(left), None) => left.start,
+            (None, Some(right)) => right.start,
+            (None, None) => break,
+        };
+        for line in &base_lines[base_cursor..start] {
+            output.push_str(line);
+        }
+        let mut group_start = start;
+        let mut group_end = start;
+        let mut group_left = Vec::new();
+        let mut group_right = Vec::new();
+
+        loop {
+            let mut consumed = false;
+            while left_index < left_edits.len()
+                && overlaps(group_start, group_end, &left_edits[left_index])
+            {
+                let edit = left_edits[left_index].clone();
+                group_start = group_start.min(edit.start);
+                group_end = group_end.max(edit.end);
+                group_left.push(edit);
+                left_index += 1;
+                consumed = true;
             }
-        ),
-        1,
-    )
+            while right_index < right_edits.len()
+                && overlaps(group_start, group_end, &right_edits[right_index])
+            {
+                let edit = right_edits[right_index].clone();
+                group_start = group_start.min(edit.start);
+                group_end = group_end.max(edit.end);
+                group_right.push(edit);
+                right_index += 1;
+                consumed = true;
+            }
+            if !consumed {
+                break;
+            }
+        }
+
+        let left_result = apply_segment(&base_lines, group_start, group_end, &group_left);
+        let right_result = apply_segment(&base_lines, group_start, group_end, &group_right);
+        if group_left.is_empty() {
+            append_lines(&mut output, &right_result);
+        } else if group_right.is_empty() || left_result == right_result {
+            append_lines(&mut output, &left_result);
+        } else {
+            conflicts += 1;
+            append_marker(&mut output, "<<<<<<< LEFT\n");
+            append_lines(&mut output, &left_result);
+            append_marker(&mut output, "=======\n");
+            append_lines(&mut output, &right_result);
+            append_marker(&mut output, ">>>>>>> RIGHT\n");
+        }
+        base_cursor = group_end;
+    }
+    for line in &base_lines[base_cursor..] {
+        output.push_str(line);
+    }
+    (output, conflicts)
 }
 
-fn ensure_trailing_newline(text: &str) -> &str {
-    text
+fn append_marker(output: &mut String, marker: &str) {
+    if !output.is_empty() && !output.ends_with('\n') {
+        output.push('\n');
+    }
+    output.push_str(marker);
+}
+
+fn append_lines(output: &mut String, lines: &[String]) {
+    for line in lines {
+        output.push_str(line);
+    }
+    if !lines.is_empty() && !output.ends_with('\n') {
+        output.push('\n');
+    }
 }
 
 #[cfg(test)]
@@ -189,5 +337,16 @@ mod tests {
         assert_eq!(conflicts, 1);
         assert!(merged.contains("<<<<<<< LEFT"));
         assert!(merged.contains(">>>>>>> RIGHT"));
+    }
+
+    #[test]
+    fn three_way_merge_combines_non_overlapping_changes() {
+        let (merged, conflicts) = merge_three_way(
+            "first\nmiddle\nlast\n",
+            "FIRST\nmiddle\nlast\n",
+            "first\nmiddle\nLAST\n",
+        );
+        assert_eq!(conflicts, 0);
+        assert_eq!(merged, "FIRST\nmiddle\nLAST\n");
     }
 }

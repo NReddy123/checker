@@ -78,8 +78,25 @@ pub fn synchronize_folders(
         }
         let source_file = source.join(relative);
         let destination_file = destination.join(relative);
-        let source_metadata = fs::symlink_metadata(&source_file)?;
+        let source_metadata = match fs::symlink_metadata(&source_file) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
         if !source_metadata.is_file() || source_metadata.file_type().is_symlink() {
+            continue;
+        }
+        if fs::symlink_metadata(&destination_file)
+            .is_ok_and(|metadata| metadata.file_type().is_symlink())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "refusing to overwrite a symbolic link in the destination",
+            ));
+        }
+        let source_bytes = fs::read(&source_file)?;
+        if fs::read(&destination_file).is_ok_and(|destination_bytes| destination_bytes == source_bytes)
+        {
             continue;
         }
         let parent = destination_file
