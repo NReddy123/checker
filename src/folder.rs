@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FolderStatus {
@@ -13,9 +14,17 @@ pub enum FolderStatus {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileMetadata {
+    pub size: u64,
+    pub modified: Option<SystemTime>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FolderEntry {
     pub relative_path: String,
     pub status: FolderStatus,
+    pub left: Option<FileMetadata>,
+    pub right: Option<FileMetadata>,
 }
 
 pub fn compare_folders(
@@ -46,6 +55,12 @@ pub fn compare_folders(
                     .any(|pattern| wildcard_matches(pattern, path))
         })
         .map(|relative_path| {
+            let left = left_files
+                .get(&relative_path)
+                .and_then(|path| file_metadata(path));
+            let right = right_files
+                .get(&relative_path)
+                .and_then(|path| file_metadata(path));
             let status = match (
                 left_files.get(&relative_path),
                 right_files.get(&relative_path),
@@ -62,9 +77,19 @@ pub fn compare_folders(
             FolderEntry {
                 relative_path,
                 status,
+                left,
+                right,
             }
         })
         .collect())
+}
+
+fn file_metadata(path: &Path) -> Option<FileMetadata> {
+    let metadata = fs::metadata(path).ok()?;
+    Some(FileMetadata {
+        size: metadata.len(),
+        modified: metadata.modified().ok(),
+    })
 }
 
 pub fn synchronize_folders(
@@ -302,6 +327,12 @@ mod tests {
                 .status,
             FolderStatus::Different
         );
+        let same = entries
+            .iter()
+            .find(|entry| entry.relative_path == "same.txt")
+            .unwrap();
+        assert_eq!(same.left.as_ref().unwrap().size, 4);
+        assert_eq!(same.right.as_ref().unwrap().size, 4);
         let filtered = compare_folders(&left, &right, &["*.rs".into()], &[]).unwrap();
         assert_eq!(filtered.len(), 1);
 

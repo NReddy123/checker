@@ -1,0 +1,8 @@
+Quarterly service report
+Period: Q3 2026
+Region: North America
+Active customers: 1240
+Renewal rate: 91%
+Support response time: 4 hours
+Priority: Standard
+Prepared by: Operations

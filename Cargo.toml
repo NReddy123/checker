@@ -4,5 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+chrono = "0.4.45"
 gpui-kit = "0.7.3"
+rfd = "0.15.4"
 similar = "2.7.0"
